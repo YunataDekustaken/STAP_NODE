@@ -272,10 +272,15 @@ void loop() {
 // 9. PYTHON COMMAND PARSER
 // =============================================================
 void parsePythonCommand(String msg) {
+  // ── Heartbeat commands — reset timeout ──────────────────────
   if (msg.startsWith("PHASE:")   ||
       msg.startsWith("YELLOW:")  ||
       msg.startsWith("PING:")    ||
-      msg.startsWith("DISPLAY:")) {
+      msg.startsWith("DISPLAY:") ||
+      msg.startsWith("MODE:")    ||
+      msg.startsWith("MANUAL_LIGHT:") ||
+      msg.startsWith("HAZARD:")  ||
+      msg.startsWith("EMERGENCY_OVERRIDE:")) {
     lastCommMillis     = millis();
     silenceStartMillis = 0;
     isOffline          = false;
@@ -283,32 +288,133 @@ void parsePythonCommand(String msg) {
     return;
   }
 
+  // ── PING — keepalive only, no action ────────────────────────
   if (msg.startsWith("PING:")) {
     return;
   }
 
+  // ── MODE SWITCH ──────────────────────────────────────────────
+  if (msg.startsWith("MODE:")) {
+    String mode = msg.substring(5);
+    mode.trim();
+
+    if (mode == "AUTO") {
+      currentMode        = AUTO;
+      manualHazardActive = false;
+      manualState        = MAN_STOPPED;
+      manualTarget       = MAN_STOPPED;
+      updateShiftRegister();
+
+    } else if (mode == "MANUAL") {
+      currentMode  = MANUAL;
+      manualState  = MAN_STOPPED;
+      manualTarget = MAN_STOPPED;
+      manualHazardActive = false;
+      setAllRed();
+      displayOff();
+
+    } else if (mode == "HAZARD") {
+      currentMode        = MANUAL;
+      manualHazardActive = true;
+      manualState        = MAN_STOPPED;
+      manualTarget       = MAN_STOPPED;
+      updateShiftRegister();
+    }
+    return;
+  }
+
+  // ── HAZARD per lane (flashing yellow) ───────────────────────
+  if (msg.startsWith("HAZARD:")) {
+    currentMode        = MANUAL;
+    manualHazardActive = true;
+    manualState        = MAN_STOPPED;
+    blinkYellows();
+    return;
+  }
+
+  // ── MANUAL LIGHT OVERRIDE ────────────────────────────────────
+  // Format: MANUAL_LIGHT:NORTH,GREEN
+  if (msg.startsWith("MANUAL_LIGHT:")) {
+    String payload = msg.substring(13);
+    payload.trim();
+    int commaIdx = payload.indexOf(',');
+    if (commaIdx == -1) return;
+
+    String lane  = payload.substring(0, commaIdx);
+    String state = payload.substring(commaIdx + 1);
+    lane.trim();
+    state.trim();
+
+    // Set the correct manual state so handleManual() renders it
+    if      (lane == "NORTH" && state == "GREEN")  { manualState = MAN_N_GO; setNorthGo(); }
+    else if (lane == "SOUTH" && state == "GREEN")  { manualState = MAN_S_GO; setSouthGo(); }
+    else if (lane == "EAST"  && state == "GREEN")  { manualState = MAN_E_GO; setEastGo();  }
+    else if (lane == "WEST"  && state == "GREEN")  { manualState = MAN_W_GO; setWestGo();  }
+    else if (state == "RED") {
+      // RED on a specific lane while keeping others unchanged
+      // Simplest safe behavior: all red
+      manualState = MAN_STOPPED;
+      setAllRed();
+    }
+    else if (state == "YELLOW") {
+      setYellow(lane);
+    }
+
+    updateTimers(-1, -1, -1, -1);
+    return;
+  }
+
+  // ── EMERGENCY OVERRIDE ───────────────────────────────────────
+  // Format: EMERGENCY_OVERRIDE:NORTH
+  if (msg.startsWith("EMERGENCY_OVERRIDE:")) {
+    String lane = msg.substring(19);
+    lane.trim();
+
+    currentMode        = AUTO;
+    manualHazardActive = false;
+    isOffline          = false;
+
+    // Trigger yellow on current active lane first
+    onlineSignal      = SIG_YELLOW;
+    yellowStartMillis = millis();
+    setYellow(activeLane);
+    displayYellowCountdown(YELLOW_TIME);
+
+    // After yellow, the PHASE: command from Python will set the new lane green
+    // We just pre-set activeLane so LCD shows correct info
+    activeLane = lane;
+    return;
+  }
+
+  // ── DISPLAY COMMAND ──────────────────────────────────────────
   if (msg.startsWith("DISPLAY:")) {
     String payload = msg.substring(8);
     payload.trim();
 
     if (payload == "OFF") {
       displayOff();
-    }
-    else if (payload.startsWith("YELLOW,")) {
+    } else if (payload.startsWith("YELLOW,")) {
       int seconds = payload.substring(7).toInt();
-      if (seconds > 0) {
-        displayYellowCountdown(seconds);
-      }
+      if (seconds > 0) displayYellowCountdown(seconds);
     }
     return;
   }
 
+  // ── YELLOW TRANSITION ────────────────────────────────────────
+  if (msg.startsWith("YELLOW:")) {
+    String lane = msg.substring(7);
+    lane.trim();
+    activeLane        = lane;
+    onlineSignal      = SIG_YELLOW;
+    yellowStartMillis = millis();
+    return;
+  }
+
+  // ── PHASE / GREEN ────────────────────────────────────────────
   if (msg.startsWith("PHASE:")) {
     if (onlineSignal == SIG_YELLOW) {
       unsigned long elapsed = millis() - yellowStartMillis;
-      if (elapsed < (unsigned long)(YELLOW_TIME * 1000)) {
-        return;
-      }
+      if (elapsed < (unsigned long)(YELLOW_TIME * 1000)) return;
     }
 
     int    commaIdx = msg.indexOf(',');
@@ -327,15 +433,6 @@ void parsePythonCommand(String msg) {
     activeLane     = lane;
     greenCountdown = duration;
     onlineSignal   = SIG_GREEN;
-    return;
-  }
-
-  if (msg.startsWith("YELLOW:")) {
-    String lane = msg.substring(7);
-    lane.trim();
-    activeLane        = lane;
-    onlineSignal      = SIG_YELLOW;
-    yellowStartMillis = millis();
     return;
   }
 }
@@ -559,7 +656,7 @@ void handleManual(unsigned long ms) {
   else if (manualState == MAN_S_GO) { setSouthGo(); updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: SOUTH", "Manual override act.", "Select next lane ->"); }
   else if (manualState == MAN_E_GO) { setEastGo();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: EAST",  "Manual override act.", "Select next lane ->"); }
   else if (manualState == MAN_W_GO) { setWestGo();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: WEST",  "Manual override act.", "Select next lane ->"); }
-  else                              { setAllRed();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> IDLE", "All lanes RED", "Select a lane to GO"); }
+  else                              { setAllRed();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> REMOTE CONTROL", "All lanes RED", "Awaiting command..."); }
 }
 
 // =============================================================
