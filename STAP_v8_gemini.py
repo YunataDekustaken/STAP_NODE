@@ -1,20 +1,15 @@
 """
 STAP: Smart Traffic Automation Program
 =======================================
-v11 — Whole-Frame Batched Inference + Post-Inference ROI Masking Engine.
+v11.1 — Multi-Tracker State Isolation Architecture.
 
-CHANGES FROM v10:
+CHANGES FROM v11:
   ┌─────────────────────────────────────────────────────────────────────┐
-  │  BUG: Bounding boxes flicker ("pawala-wala") & drop persistently.    │
-  │  FIX: Removed destructive pre-cropping. The system now runs full-   │
-  │       frame tracking and evaluates coordinates after inference.     │
-  ├─────────────────────────────────────────────────────────────────────┤
-  │  PERF: Converted sequential 4-lane loops into a single GPU Batched  │
-  │        Tracking call, cutting overhead by up to 75% via FP16 half.  │
-  ├─────────────────────────────────────────────────────────────────────┤
-  │  TUNE: Adjusted CONF_THRESHOLD to 0.30 for dense, low-flicker      │
-  │        tracking matching the precision layout of professional apps. │
-  └─────────────────────────────────────────────────────────────────────┘
+  │  BUG: Bounding boxes still flicker/drop when batched together.      │
+  │  FIX: Isolated tracker instances per lane. Initialized four independent│
+  │       YOLO handles so their inner Kalman/ByteTrack histories don't │
+  │       cross-contaminate and drop valid vehicles.                    │
+  ├─────────────────────────────────────────────────────────────────────┘
 """
 
 from ultralytics import YOLO
@@ -59,7 +54,7 @@ CAM_HEIGHT   = 480
 TARGET_FPS   = 30
 DATA_TIMEOUT = 5.0
 
-# Whole-Frame Polygon ROIs matching the exact window coordinates (replaces rigid crops)
+# Whole-Frame Polygon ROIs matching the exact window coordinates
 ROI_POLYGONS = {
     "NORTH": np.array([[int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.2)], [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.2)], 
                        [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.95)], [int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.95)]], dtype=np.int32),
@@ -85,7 +80,7 @@ LOS_DELTA      = {"A":-15,"B":-8,"C":0,"D":+8,"E":+12,"F":+15}
 PING_INTERVAL = 0.4
 
 # Detection Stability Tuning
-CONF_THRESHOLD            = 0.30   # Balanced threshold optimized for whole-frame tracking
+CONF_THRESHOLD            = 0.30   
 EMERGENCY_SUSTAIN_SECONDS = 3.0    
 COUNT_SMOOTH_WINDOW       = 8      
 
@@ -217,62 +212,59 @@ class BackgroundVideoReader(threading.Thread):
                 time.sleep(sleep_t)
 
 # =============================================================
-# 5. AI INFERENCE CORE (Unified 4-Stream GPU Batch Inference)
+# 5. AI INFERENCE CORE (Isolated Model Handles for Tracking)
 # =============================================================
 class BackgroundAIProcessor(threading.Thread):
     def __init__(self, model_path, device):
         super().__init__(daemon=True)
-        self.model   = YOLO(model_path)
+        # Initialize 4 individual model tracking states to prevent identity cross-contamination
+        self.models = {lane: YOLO(model_path) for lane in LANE_NAMES}
         self.device  = device
-        self.labels  = self.model.names
+        self.labels  = self.models["NORTH"].names
         self.running = True
         self.half    = device != "cpu"
         
         if device != "cpu":
-            self.model.to(device)
-            print(f"[STAP] ✅ YOLO model initialized on GPU (device={device})")
+            for lane in LANE_NAMES:
+                self.models[lane].to(device)
+            print(f"[STAP] ✅ 4 Isolated Tracker Streams initialized on GPU (device={device})")
         else:
-            print("[STAP] ⚠️  YOLO model on CPU")
+            print("[STAP] ⚠️  YOLO models on CPU")
 
     def run(self):
         global cached_boxes, vehicle_counts, lane_statuses
         while self.running:
-            batch_frames = []
-            valid = True
-            
-            # Gather entire frame buffers natively without damaging boundary constraints
-            with frame_lock:
-                for idx, lane in enumerate(LANE_NAMES):
-                    img = latest_frames[idx]
-                    if img is None:
-                        valid = False; break
-                    batch_frames.append(img.copy())
-
-            if not valid:
-                time.sleep(0.05); continue
-
-            try:
-                # Upgraded to unified Batch Inference mode running at full resolution
-                lane_results = self.model.track(
-                    batch_frames, 
-                    persist=True, 
-                    conf=CONF_THRESHOLD,
-                    verbose=False, 
-                    device=self.device, 
-                    imgsz=640,
-                    half=self.half
-                )
-            except Exception as e:
-                print(f"[STAP] Critical Batched Inference Error: {e}")
-                time.sleep(0.05); continue
-
             temp_counts   = {l: 0 for l in LANE_NAMES}
             temp_statuses = {l: "CLEAR" for l in LANE_NAMES}
             temp_boxes    = {l: [] for l in LANE_NAMES}
 
             for idx, lane in enumerate(LANE_NAMES):
-                res = lane_results[idx]
-                if res is None or res.boxes is None: continue
+                img = None
+                with frame_lock:
+                    if latest_frames[idx] is not None:
+                        img = latest_frames[idx].copy()
+                
+                if img is None:
+                    continue
+
+                try:
+                    # Run tracking on the isolated handle for this specific continuous stream
+                    r = self.models[lane].track(
+                        img, 
+                        persist=True, 
+                        conf=CONF_THRESHOLD,
+                        verbose=False, 
+                        device=self.device, 
+                        imgsz=640,
+                        half=self.half
+                    )
+                    res = r[0]
+                except Exception as e:
+                    print(f"[STAP] Track engine drop on {lane}: {e}")
+                    continue
+
+                if res is None or res.boxes is None: 
+                    continue
                 
                 polygon = ROI_POLYGONS[lane]
                 
@@ -281,10 +273,10 @@ class BackgroundAIProcessor(threading.Thread):
                     conf   = float(box.conf[0])
                     bx1, by1, bx2, by2 = map(int, box.xyxy[0])
                     
-                    # Compute vehicle centroid point to match professional polygon layouts
+                    # Compute centroid coordinates
                     cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
                     
-                    # Mathematical Point-In-Polygon Mask Evaluation
+                    # Polygon Mask evaluation
                     is_inside = cv2.pointPolygonTest(polygon, (float(cx), float(cy)), False) >= 0
                     if not is_inside: 
                         continue
@@ -580,7 +572,7 @@ while True:
     for idx, lane in enumerate(LANE_NAMES):
         fr = drawn[idx]
         
-        # Render the adaptive bounding ROI polygon
+        # Render boundary tracking polygon
         cv2.polylines(fr, [ROI_POLYGONS[lane]], isClosed=True, color=(255,165,0), thickness=2)
 
         for b in local_boxes[lane]:
@@ -624,12 +616,11 @@ while True:
 
     cv2.imshow("STAP Local Engine Monitor", grid)
 
-    # Dispatch processed stream matrices out to the Flask streaming buffers
+    # Dispatch frames out to Flask stream nodes
     for idx, lane in enumerate(LANE_NAMES):
         with lane_stream_locks[lane]:
             global_lane_frames[lane] = drawn[idx].copy()
 
-    # Hardware Control Automation Decisions
     if not manual_override:
         if snap_state == "GREEN":
             emg = emergency_lane()
