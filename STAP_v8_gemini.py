@@ -80,7 +80,7 @@ LOS_DELTA      = {"A":-15,"B":-8,"C":0,"D":+8,"E":+12,"F":+15}
 PING_INTERVAL = 0.4
 
 # Detection Stability Tuning
-CONF_THRESHOLD            = 0.30   
+CONF_THRESHOLD            = 0.80   
 EMERGENCY_SUSTAIN_SECONDS = 3.0    
 COUNT_SMOOTH_WINDOW       = 8      
 
