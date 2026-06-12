@@ -23,7 +23,7 @@ import torch
 import os
 import collections
 from datetime import datetime
-from flask import Flask, Response
+from flask import Flask, Response, request, jsonify
 
 # =============================================================
 # 1. CONFIGURATION & FLASK SERVER BOOT
@@ -470,6 +470,130 @@ def feed_east(): return Response(generate_lane_stream("EAST"), mimetype='multipa
 
 @app.route('/video_feed/west')
 def feed_west(): return Response(generate_lane_stream("WEST"), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+# =============================================================
+# 8b. CONTROL & STATUS API ROUTES
+# =============================================================
+from flask import request, jsonify
+
+@app.after_request
+def add_cors(response):
+    response.headers["Access-Control-Allow-Origin"]  = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
+
+@app.route('/control/mode', methods=['POST', 'OPTIONS'])
+def control_mode():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    global manual_override, current_phase_idx, phase_state, green_start_time, committed_green
+
+    data = request.get_json(force=True)
+    mode = data.get('mode', '').lower()
+
+    if mode not in ['auto', 'manual', 'hazard']:
+        return jsonify({'success': False, 'message': 'Invalid mode. Use auto, manual, or hazard.'}), 400
+
+    if mode == 'auto':
+        manual_override = False
+        send_to_esp32('MODE:AUTO')
+        # Resume normal green phase
+        with phase_lock:
+            lane = PHASE_ORDER[current_phase_idx]
+        green = compute_green_time(lane, rain_detected)
+        start_green(lane, green)
+
+    elif mode == 'manual':
+        manual_override = True
+        send_to_esp32('MODE:MANUAL')
+
+    elif mode == 'hazard':
+        manual_override = True
+        send_to_esp32('MODE:HAZARD')
+        # Flash all lights — send hazard signal per lane
+        for lane in LANE_NAMES:
+            send_to_esp32(f'HAZARD:{lane}')
+
+    return jsonify({'success': True, 'mode': mode})
+
+
+@app.route('/control/light', methods=['POST', 'OPTIONS'])
+def control_light():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    if not manual_override:
+        return jsonify({'success': False, 'message': 'Node must be in manual or hazard mode first.'}), 422
+
+    data  = request.get_json(force=True)
+    lane  = data.get('lane', '').upper()
+    state = data.get('state', '').lower()
+
+    if lane not in LANE_NAMES:
+        return jsonify({'success': False, 'message': f'Invalid lane. Use: {LANE_NAMES}'}), 400
+
+    if state not in ['red', 'yellow', 'green']:
+        return jsonify({'success': False, 'message': 'Invalid state. Use red, yellow, or green.'}), 400
+
+    send_to_esp32(f'MANUAL_LIGHT:{lane},{state.upper()}')
+    return jsonify({'success': True, 'lane': lane, 'state': state})
+
+
+@app.route('/control/emergency', methods=['POST', 'OPTIONS'])
+def control_emergency():
+    if request.method == 'OPTIONS':
+        return jsonify({}), 200
+
+    data = request.get_json(force=True)
+    lane = data.get('lane', '').upper()
+
+    if lane not in LANE_NAMES:
+        return jsonify({'success': False, 'message': f'Invalid lane. Use: {LANE_NAMES}'}), 400
+
+    # Force immediate green for the emergency lane
+    start_yellow(PHASE_ORDER[current_phase_idx])
+    time.sleep(0.1)
+    start_green(lane, compute_green_time(lane, rain_detected))
+    send_to_esp32(f'EMERGENCY_OVERRIDE:{lane}')
+
+    return jsonify({'success': True, 'emergency_lane': lane})
+
+
+@app.route('/status', methods=['GET'])
+def get_status():
+    with result_lock:
+        counts   = vehicle_counts.copy()
+        statuses = lane_statuses.copy()
+
+    with phase_lock:
+        active_lane  = PHASE_ORDER[current_phase_idx]
+        current_state = phase_state
+        green_dur    = committed_green
+
+    now = time.time()
+    if current_state == 'GREEN':
+        elapsed   = now - green_start_time
+        remaining = max(0, green_dur - int(elapsed))
+    else:
+        elapsed   = now - yellow_start_time if yellow_start_time > 0 else 0
+        remaining = max(0, YELLOW_TIME - int(elapsed))
+
+    los_per_lane = {lane: classify_los(counts[lane]) for lane in LANE_NAMES}
+
+    return jsonify({
+        'active_lane':    active_lane,
+        'phase_state':    current_state,
+        'remaining_secs': remaining,
+        'green_duration': green_dur,
+        'mode':           'manual' if manual_override else 'auto',
+        'rain':           rain_detected,
+        'vehicle_counts': counts,
+        'los':            los_per_lane,
+        'lane_statuses':  statuses,
+    })
+
 
 def run_flask_server():
     app.run(host='0.0.0.0', port=5000, threaded=True, use_reloader=False)
