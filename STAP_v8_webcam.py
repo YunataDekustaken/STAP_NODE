@@ -1,15 +1,14 @@
 """
 STAP: Smart Traffic Automation Program
 =======================================
-v11.2 — Unified Hardware Stream & Single-Pass Layout Architecture.
+v11.3 — Inline Synchronous Hardware Capture Architecture.
 
-CHANGES FROM v11.1:
+CHANGES FROM v11.2:
   ┌─────────────────────────────────────────────────────────────────────┐
-  │  BUG: CRT-like horizontal visual flickering / camera drops.        │
-  │  FIX: Implemented UnifiedWebcamDriver to capture frames linearly    │
-  │       sequentially, eliminating USB hub host collisions.            │
-  │  FIX: Migrated AI core to a unified single-pass 2x2 grid tracking   │
-  │       pipeline to cut resource utilization by 75%.                 │
+  │  BUG: Identical webcams still drop out when thread-managed.          │
+  │  FIX: Completely removed webcam background threads. Captured and    │
+  │       managed hardware frames directly inside the main loop line-by-│
+  │       line, exactly reproducing the stable old code's architecture. │
   └─────────────────────────────────────────────────────────────────────┘
 """
 
@@ -42,9 +41,7 @@ VEHICLE_CLASS_IDS   = [1, 2, 3, 4, 6, 7, 8, 10, 11, 12, 13]
 LANE_NAMES  = ["NORTH", "SOUTH", "EAST", "WEST"]
 PHASE_ORDER = ["NORTH", "SOUTH", "EAST", "WEST"]
 
-# Windows Hardware Video Capture Device Indices
-VIDEO_FILES = [0, 1, 2, 3]  # Maps strictly to [NORTH, SOUTH, EAST, WEST]
-LOOP_VIDEOS  = False
+CAMERA_INDICES = [0, 1, 2, 3] 
 
 CAM_WIDTH    = 640
 CAM_HEIGHT   = 480
@@ -182,68 +179,23 @@ emg_buffer     = EmergencyBuffer(EMERGENCY_SUSTAIN_SECONDS)
 count_smoother = VehicleCountSmoother(COUNT_SMOOTH_WINDOW)
 
 # =============================================================
-# 4. UNIFIED SEQUENTIAL WEBCAM DRIVER (PREVENTS USB COLLISIONS)
+# 4. INITIALIZE HARDWARE CAMERAS SEQUENTIALLY (OLD CODE LOGIC)
 # =============================================================
-class UnifiedWebcamDriver(threading.Thread):
-    def __init__(self, indices_or_paths):
-        super().__init__(daemon=True)
-        self.sources = indices_or_paths
-        self.caps = []
-        self.running = True
-        self.frame_interval = 1.0 / TARGET_FPS
-        self.last_reconnect_time = [0.0] * len(self.sources)
+caps = []
+for idx in CAMERA_INDICES:
+    cap = cv2.VideoCapture(idx)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+    caps.append(cap)
 
-        # Pre-build "NO SIGNAL" fallback placeholders
-        self.blank_frames = []
-        for i in range(4):
-            blank = np.zeros((CAM_HEIGHT, CAM_WIDTH, 3), dtype=np.uint8)
-            text = f"{LANE_NAMES[i]} NO SIGNAL"
-            text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)[0]
-            tx = (CAM_WIDTH - text_size[0]) // 2
-            ty = (CAM_HEIGHT + text_size[1]) // 2
-            cv2.putText(blank, text, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-            self.blank_frames.append(blank)
+last_reconnect_time = [0.0, 0.0, 0.0, 0.0]
 
-        print("[STAP] Booking hardware camera frames in strict linear sequence...")
-        for src in self.sources:
-            cap = cv2.VideoCapture(src, cv2.CAP_DSHOW) if isinstance(src, int) else cv2.VideoCapture(src)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
-            self.caps.append(cap)
-
-    def run(self):
-        print("[STAP] ✅ Unified Webcam Driver running. USB Host Bus protected.")
-        while self.running:
-            t0 = time.time()
-
-            for i, cap in enumerate(self.caps):
-                ret, frame = cap.read()
-
-                if not ret:
-                    with frame_lock:
-                        latest_frames[i] = self.blank_frames[i].copy()
-
-                    if t0 - self.last_reconnect_time[i] > RECONNECT_TIMEOUT:
-                        print(f"[STAP] ⚠️ Lane {LANE_NAMES[i]} dropped. Reconnecting...")
-                        cap.release()
-                        new_cap = cv2.VideoCapture(self.sources[i], cv2.CAP_DSHOW) if isinstance(self.sources[i], int) else cv2.VideoCapture(self.sources[i])
-                        new_cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                        new_cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
-                        new_cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
-                        self.caps[i] = new_cap
-                        self.last_reconnect_time[i] = t0
-                    continue
-
-                with frame_lock:
-                    latest_frames[i] = cv2.resize(frame, (CAM_WIDTH, CAM_HEIGHT))
-
-            elapsed = time.time() - t0
-            sleep_t = self.frame_interval - elapsed
-            if sleep_t > 0:
-                time.sleep(sleep_t)
-            else:
-                time.sleep(0.001)
+# Build "NO SIGNAL" placeholder template frame
+blank_frame = np.zeros((CAM_HEIGHT, CAM_WIDTH, 3), dtype=np.uint8)
+text_size = cv2.getTextSize("NO SIGNAL", cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)[0]
+text_x = (CAM_WIDTH - text_size[0]) // 2
+text_y = (CAM_HEIGHT + text_size[1]) // 2
+cv2.putText(blank_frame, "NO SIGNAL", (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, 1.5, (0, 0, 255), 3)
 
 # =============================================================
 # 5. AI INFERENCE CORE (Optimized Single-Pass 2x2 Grid Processing)
@@ -365,10 +317,6 @@ class BackgroundAIProcessor(threading.Thread):
 # =============================================================
 # 6. INITIALIZATION — BOOT MANAGEMENT
 # =============================================================
-print("[STAP] Booting Unified Sequential Web interface...")
-webcam_driver = UnifiedWebcamDriver(VIDEO_FILES)
-webcam_driver.start()
-
 print("[STAP] Connecting to ESP32 Hardware Module...")
 try:
     ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
@@ -679,9 +627,34 @@ while True:
     read_serial_incoming()
     is_offline = (ser is None) or (t_loop - last_comm_time > DATA_TIMEOUT)
 
-    with frame_lock:
-        imgs = [f.copy() if f is not None else None for f in latest_frames]
+    # 1. READ ALL 4 WEBCAMS INLINE (EXACT COPIED LOGIC FROM OLD STABLE CODE)
+    current_frames = []
+    for i, cap in enumerate(caps):
+        ret, frame = cap.read()
+        
+        if not ret:
+            # Camera dropped out. Inject the placeholder frame block.
+            frame = blank_frame.copy()
+            
+            # Inline Auto-reconnection handler
+            if t_loop - last_reconnect_time[i] > RECONNECT_TIMEOUT:
+                print(f"[STAP] ⚠️ Camera {LANE_NAMES[i]} lost index. Re-grabbing hardware stream...")
+                cap.release()
+                caps[i] = cv2.VideoCapture(CAMERA_INDICES[i])
+                caps[i].set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
+                caps[i].set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
+                last_reconnect_time[i] = t_loop
+        else:
+            frame = cv2.resize(frame, (CAM_WIDTH, CAM_HEIGHT))
+            
+        current_frames.append(frame)
 
+    # Copy the frames over safely to the global variable block for the AI background handler
+    with frame_lock:
+        for idx in range(4):
+            latest_frames[idx] = current_frames[idx].copy()
+
+    # Load computed analysis objects
     with result_lock:
         local_boxes    = {k: list(v) for k, v in cached_boxes.items()}
         local_counts   = vehicle_counts.copy()
@@ -694,23 +667,14 @@ while True:
         snap_g_start = green_start_time
         snap_y_start = yellow_start_time
 
-    if any(f is None for f in imgs):
-        time.sleep(0.01); continue
-
-    now = time.time()
-    if snap_state == "GREEN":
-        green_elapsed  = now - snap_g_start
-        green_remain   = max(0, snap_green - int(green_elapsed))
-        yellow_elapsed = 0.0
-    else:
-        green_elapsed  = snap_green
-        green_remain   = 0
-        yellow_elapsed = now - snap_y_start if snap_y_start > 0 else 0.0
+    green_elapsed  = t_loop - snap_g_start
+    green_remain   = max(0, snap_green - int(green_elapsed))
+    yellow_elapsed = t_loop - snap_y_start if snap_y_start > 0 else 0.0
 
     display_greens = {lane: compute_green_time(lane, rain_detected) for lane in LANE_NAMES}
     display_greens[snap_lane] = snap_green
 
-    drawn = list(imgs)
+    drawn = list(current_frames)
     for idx, lane in enumerate(LANE_NAMES):
         fr = drawn[idx]
         cv2.polylines(fr, [ROI_POLYGONS[lane]], isClosed=True, color=(255,165,0), thickness=2)
@@ -773,4 +737,6 @@ while True:
         break
     time.sleep(max(0.001, (1.0/TARGET_FPS) - (time.time() - t_loop)))
 
+for cap in caps:
+    cap.release()
 cv2.destroyAllWindows()
