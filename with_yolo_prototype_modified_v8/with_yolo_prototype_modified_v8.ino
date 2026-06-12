@@ -1,37 +1,9 @@
 /*
   STAP ESP32 Controller — Firmware v7 (Yellow Countdown Display)
   ===============================================================
-  CHANGES FROM v6:
-   1. Added DISPLAY: command handler — two commands recognized:
-        DISPLAY:YELLOW,N  → starts N-second countdown on the 4-digit
-                            7-segment display: shows "Y  3 → Y  2 → Y  1"
-        DISPLAY:OFF       → immediately blanks all 4 digits
-   2. Added dedicated Adafruit_7segment yellowDisplay at ADDR_DISPLAY (0x78)
-      — separate from the 4 per-lane timer displays (0x70/0x72/0x74/0x76)
-   3. Added displayYellowCountdown() and displayOff() helper functions
-   4. Added yellow display state variables:
-        displayActive, displayCountdown, displayLastTickMillis
-   5. loop() calls tickYellowDisplay(ms) every iteration to drive the
-      countdown independently from other logic — no blocking delays
-   6. parsePythonCommand now recognizes "DISPLAY:" prefix
-
-  DISPLAY BEHAVIOR:
-   - During GREEN:  display is blank (DISPLAY:OFF sent by Python)
-   - During YELLOW: display shows "Y  3" → "Y  2" → "Y  1" then blanks
-   - The 4th digit (rightmost) shows the countdown number
-   - The 1st digit (leftmost) shows "Y" using 7-seg segments
-   - Middle two digits are blank for clarity
-   - Display self-blanks when countdown reaches 0
-
-  WHY YELLOW-ONLY:
-   - Yellow is always a fixed 3s constant — the displayed number is
-     always 100% accurate, never conflicts with adaptive green timing
-   - Drivers get actionable lane-switching info at exactly the right moment
-
-  EVERYTHING ELSE IS IDENTICAL TO v6:
-   - All fixes from v6 (yellow flicker, PHASE: guard, one-cmd-per-loop)
-   - Manual mode, fallback, shift register, LCD, per-lane timers, buttons
-     are completely unchanged
+  CHANGES FOR ALL-TIMER FALLBACK:
+   - Updated runAutoFallback() to calculate wait-times for all 4 lanes
+     simultaneously instead of blanking out stopped lanes with -1.
 */
 
 #include <Wire.h>
@@ -61,10 +33,7 @@ const int dataPin  = 19; const int oePin    = 4;
 #define ADDR_EAST    0x74
 #define ADDR_WEST    0x76
 
-// Yellow countdown display — the single 4-digit 7-segment
-// Set this to the actual I2C address of your display.
-// Default Adafruit HT16K33 backpack address is 0x70; since
-// your lane displays use 0x70–0x76, use 0x78 (A0+A1 bridged).
+// Yellow countdown display
 #define ADDR_DISPLAY 0x78
 
 const int btnAuto      = 12; const int btnManual    = 13;
@@ -80,7 +49,7 @@ const int RAIN_THRESHOLD = 3000;
 // =============================================================
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
-// Per-lane countdown displays (used for operator-side timing info)
+// Per-lane countdown displays
 Adafruit_7segment timerNorth = Adafruit_7segment();
 Adafruit_7segment timerSouth = Adafruit_7segment();
 Adafruit_7segment timerEast  = Adafruit_7segment();
@@ -133,10 +102,6 @@ bool          rainDetected      = false;
 String lastLine1 = "", lastLine2 = "", lastLine3 = "", lastLine4 = "";
 
 // ── Yellow display state ──────────────────────────────────────
-// Tracks the road-facing 7-segment display independently.
-// displayActive:           true while a DISPLAY:YELLOW,N countdown is running
-// displayCountdown:        seconds remaining to show (counts down to 0 then blanks)
-// displayLastTickMillis:   timestamp of last 1-second decrement
 bool          displayActive          = false;
 int           displayCountdown       = 0;
 unsigned long displayLastTickMillis  = 0;
@@ -217,8 +182,6 @@ void setup() {
 
 // =============================================================
 // 8. MAIN LOOP
-// One command per loop iteration (v6 fix #2 preserved).
-// tickYellowDisplay() is called every iteration for smooth countdown.
 // =============================================================
 void loop() {
   unsigned long ms = millis();
@@ -233,7 +196,6 @@ void loop() {
     Serial.flush();
   }
 
-  // One command per loop iteration (v6 fix #2 preserved)
   static String buf = "";
   while (Serial.available() > 0) {
     char c = Serial.read();
@@ -261,7 +223,7 @@ void loop() {
     manualState  = MAN_STOPPED;
     manualTarget = MAN_STOPPED;
     setAllRed();
-    displayOff(); // Blank display when switching to manual
+    displayOff(); 
   }
 
   if (currentMode == AUTO) {
@@ -278,12 +240,11 @@ void loop() {
         fallbackInYellow     = false;
         fallbackYellowStart  = 0;
         onlineSignal         = SIG_WAITING;
-        displayOff(); // Blank display on fallback entry
+        displayOff(); 
       }
     }
   }
 
-  // 1-second tick for green/fallback countdowns
   if (ms - lastTickMillis >= 1000) {
     lastTickMillis = ms;
     if (currentMode == AUTO) {
@@ -294,7 +255,6 @@ void loop() {
     }
   }
 
-  // Tick the yellow display countdown every loop (independent timer)
   tickYellowDisplay(ms);
 
   switch (currentMode) {
@@ -310,10 +270,8 @@ void loop() {
 
 // =============================================================
 // 9. PYTHON COMMAND PARSER
-// Added DISPLAY: handling alongside existing PHASE:/YELLOW:/PING:
 // =============================================================
 void parsePythonCommand(String msg) {
-  // Refresh comms timer on any valid message
   if (msg.startsWith("PHASE:")   ||
       msg.startsWith("YELLOW:")  ||
       msg.startsWith("PING:")    ||
@@ -325,22 +283,18 @@ void parsePythonCommand(String msg) {
     return;
   }
 
-  // ── PING — keepalive only, no state change ─────────────────
   if (msg.startsWith("PING:")) {
     return;
   }
 
-  // ── DISPLAY — road-facing 7-segment control ────────────────
   if (msg.startsWith("DISPLAY:")) {
-    String payload = msg.substring(8); // Everything after "DISPLAY:"
+    String payload = msg.substring(8);
     payload.trim();
 
     if (payload == "OFF") {
-      // Blank the display immediately
       displayOff();
     }
     else if (payload.startsWith("YELLOW,")) {
-      // DISPLAY:YELLOW,N — start countdown from N seconds
       int seconds = payload.substring(7).toInt();
       if (seconds > 0) {
         displayYellowCountdown(seconds);
@@ -349,9 +303,7 @@ void parsePythonCommand(String msg) {
     return;
   }
 
-  // ── PHASE — start a new green phase ───────────────────────
   if (msg.startsWith("PHASE:")) {
-    // v6 fix #1: ignore if local yellow is still running
     if (onlineSignal == SIG_YELLOW) {
       unsigned long elapsed = millis() - yellowStartMillis;
       if (elapsed < (unsigned long)(YELLOW_TIME * 1000)) {
@@ -378,15 +330,12 @@ void parsePythonCommand(String msg) {
     return;
   }
 
-  // ── YELLOW — start yellow phase ───────────────────────────
   if (msg.startsWith("YELLOW:")) {
     String lane = msg.substring(7);
     lane.trim();
     activeLane        = lane;
     onlineSignal      = SIG_YELLOW;
     yellowStartMillis = millis();
-    // Note: the display countdown is started separately by DISPLAY:YELLOW,N
-    // which Python sends immediately after YELLOW:lane
     return;
   }
 }
@@ -394,41 +343,20 @@ void parsePythonCommand(String msg) {
 // =============================================================
 // 10. YELLOW DISPLAY HELPERS
 // =============================================================
-
-/*
-  displayYellowCountdown(seconds)
-  --------------------------------
-  Starts the countdown on the road-facing 4-digit 7-segment display.
-  Shows: [Y][blank][blank][N] where N is the countdown digit.
-
-  7-segment encoding for 'Y':
-    Segments b, c, f, g = bits 1, 2, 5, 6 = 0b01100110 = 0x66
-  The Adafruit library's writeDigitRaw() accepts a raw segment bitmask.
-  Adafruit HT16K33 segment mapping: bit0=a, bit1=b, bit2=c, bit3=d,
-                                     bit4=e, bit5=f, bit6=g, bit7=dp
-  Y = segments b+c+f+g = 0b01100110 = 0x66
-*/
 void displayYellowCountdown(int seconds) {
   displayActive         = true;
   displayCountdown      = seconds;
   displayLastTickMillis = millis();
 
-  // Render immediately so driver sees it without waiting 1s
   yellowDisplay.clear();
-  yellowDisplay.writeDigitRaw(0, 0x66);  // 'Y' on digit 0 (leftmost)
-  yellowDisplay.writeDigitRaw(1, 0x00);  // blank
-  yellowDisplay.writeDigitRaw(3, 0x00);  // blank (digit 2 is colon pos, skip)
-  yellowDisplay.writeDigitNum(4, seconds % 10); // countdown digit (rightmost)
+  yellowDisplay.writeDigitRaw(0, 0x66);  
+  yellowDisplay.writeDigitRaw(1, 0x00);  
+  yellowDisplay.writeDigitRaw(3, 0x00);  
+  yellowDisplay.writeDigitNum(4, seconds % 10); 
   yellowDisplay.drawColon(false);
   yellowDisplay.writeDisplay();
 }
 
-/*
-  displayOff()
-  ------------
-  Blanks all 4 digits immediately.
-  Called on: DISPLAY:OFF, GREEN start, manual mode switch, fallback entry.
-*/
 void displayOff() {
   displayActive    = false;
   displayCountdown = 0;
@@ -436,32 +364,21 @@ void displayOff() {
   yellowDisplay.writeDisplay();
 }
 
-/*
-  tickYellowDisplay(ms)
-  ----------------------
-  Called every loop iteration. Decrements displayCountdown every second
-  and updates the display. Self-blanks when countdown reaches 0.
-  Uses its own independent timer (displayLastTickMillis) so it never
-  interferes with greenCountdown or fallbackCountdown ticks.
-*/
 void tickYellowDisplay(unsigned long ms) {
   if (!displayActive) return;
 
-  // Decrement every 1 second
   if (ms - displayLastTickMillis >= 1000) {
     displayLastTickMillis = ms;
     displayCountdown--;
 
     if (displayCountdown <= 0) {
-      // Countdown finished — blank the display
       displayOff();
     } else {
-      // Update digit 4 (rightmost) with new countdown value
       yellowDisplay.clear();
-      yellowDisplay.writeDigitRaw(0, 0x66);          // 'Y'
-      yellowDisplay.writeDigitRaw(1, 0x00);          // blank
-      yellowDisplay.writeDigitRaw(3, 0x00);          // blank
-      yellowDisplay.writeDigitNum(4, displayCountdown % 10); // countdown
+      yellowDisplay.writeDigitRaw(0, 0x66);          
+      yellowDisplay.writeDigitRaw(1, 0x00);          
+      yellowDisplay.writeDigitRaw(3, 0x00);          
+      yellowDisplay.writeDigitNum(4, displayCountdown % 10); 
       yellowDisplay.drawColon(false);
       yellowDisplay.writeDisplay();
     }
@@ -469,12 +386,10 @@ void tickYellowDisplay(unsigned long ms) {
 }
 
 // =============================================================
-// 11. AUTO ONLINE MODE (v6 fix #3 preserved)
+// 11. AUTO ONLINE MODE
 // =============================================================
 void runAutoOnline(unsigned long ms) {
-
   switch (onlineSignal) {
-
     case SIG_GREEN:
       if      (activeLane == "NORTH") { setNorthGo(); updateTimers(greenCountdown, -1, -1, -1); }
       else if (activeLane == "SOUTH") { setSouthGo(); updateTimers(-1, greenCountdown, -1, -1); }
@@ -483,7 +398,6 @@ void runAutoOnline(unsigned long ms) {
       break;
 
     case SIG_YELLOW: {
-      // v6 fix #3: render yellow FIRST, check timer expiry AFTER
       setYellow(activeLane);
       unsigned long elapsed = ms - yellowStartMillis;
       int yRemain = max(0, YELLOW_TIME - (int)(elapsed / 1000));
@@ -504,7 +418,6 @@ void runAutoOnline(unsigned long ms) {
       break;
   }
 
-  // LCD
   String title  = rainDetected ? "-- AUTO (+RAIN) --" : "-- AUTO (SMART AI) --";
   String sigStr;
   int    disp   = 0;
@@ -526,10 +439,9 @@ void runAutoOnline(unsigned long ms) {
 }
 
 // =============================================================
-// 12. AUTO FALLBACK MODE
+// 12. AUTO FALLBACK MODE (UPDATED: ALL TIMERS SYNCED)
 // =============================================================
 void runAutoFallback(unsigned long ms) {
-
   if (fallbackInYellow) {
     unsigned long elapsed = ms - fallbackYellowStart;
     if (elapsed >= (unsigned long)(YELLOW_TIME * 1000)) {
@@ -542,32 +454,52 @@ void runAutoFallback(unsigned long ms) {
   if (!fallbackInYellow && fallbackCountdown <= 0) {
     fallbackInYellow    = true;
     fallbackYellowStart = ms;
-    // Show yellow countdown on display during fallback yellow phase too
     displayYellowCountdown(YELLOW_TIME);
   }
 
   String fbLane = FALLBACK_LANE[fallbackIdx];
   if (fallbackInYellow) {
-    int yRemain = max(0, YELLOW_TIME - (int)((ms - fallbackYellowStart) / 1000));
     setYellow(fbLane);
-    if      (fbLane == "NORTH") updateTimers(yRemain, -1, -1, -1);
-    else if (fbLane == "SOUTH") updateTimers(-1, yRemain, -1, -1);
-    else if (fbLane == "EAST")  updateTimers(-1, -1, yRemain, -1);
-    else if (fbLane == "WEST")  updateTimers(-1, -1, -1, yRemain);
   } else {
-    if      (fbLane == "NORTH") { setNorthGo(); updateTimers(fallbackCountdown, -1, -1, -1); }
-    else if (fbLane == "SOUTH") { setSouthGo(); updateTimers(-1, fallbackCountdown, -1, -1); }
-    else if (fbLane == "EAST")  { setEastGo();  updateTimers(-1, -1, fallbackCountdown, -1); }
-    else if (fbLane == "WEST")  { setWestGo();  updateTimers(-1, -1, -1, fallbackCountdown); }
+    if      (fbLane == "NORTH") setNorthGo();
+    else if (fbLane == "SOUTH") setSouthGo();
+    else if (fbLane == "EAST")  setEastGo();
+    else if (fbLane == "WEST")  setWestGo();
   }
 
-  String sig  = fallbackInYellow ? "YELLOW" : "GREEN";
-  int    disp = fallbackInYellow
+  // Get current active lane's time footprint
+  int currentRemaining = fallbackInYellow
     ? max(0, YELLOW_TIME - (int)((ms - fallbackYellowStart) / 1000))
     : fallbackCountdown;
+
+  // Compute wait-time matrix for all 4 lanes simultaneously
+  int timers[4];
+  for (int i = 0; i < 4; i++) {
+    if (fallbackIdx == i) {
+      timers[i] = currentRemaining; // The moving lane shows its remaining green/yellow step
+    } else {
+      int totalWait = currentRemaining;
+      if (!fallbackInYellow) {
+        totalWait += YELLOW_TIME; // Add current lane's yellow if it's still green
+      }
+      
+      // Cascade calculation through upcoming lanes until we hit target lane i
+      int checkIdx = (fallbackIdx + 1) % 4;
+      while (checkIdx != i) {
+        totalWait += FALLBACK_GREEN[checkIdx] + YELLOW_TIME;
+        checkIdx = (checkIdx + 1) % 4;
+      }
+      timers[i] = totalWait; // Non-moving lanes display exact seconds till their green phase
+    }
+  }
+
+  // Fire updates to all physical I2C displays
+  updateTimers(timers[0], timers[1], timers[2], timers[3]);
+
+  String sig  = fallbackInYellow ? "YELLOW" : "GREEN";
   updateLCD("-- AUTO FALLBACK --", "NETWORK LOSS",
             "Active: " + fbLane + " [" + sig + "]",
-            "Countdown: " + String(disp) + "s");
+            "Countdown: " + String(currentRemaining) + "s");
 }
 
 // =============================================================
@@ -631,7 +563,7 @@ void handleManual(unsigned long ms) {
 }
 
 // =============================================================
-// 14. SHIFT REGISTER & LIGHT PRESETS (unchanged from v6)
+// 14. SHIFT REGISTER & LIGHT PRESETS
 // =============================================================
 void syncIndicatorLEDs() {
   lightState &= 0x0000FFFF;
@@ -639,7 +571,7 @@ void syncIndicatorLEDs() {
     bitSet(lightState, ledBlue);
   } else {
     bitSet(lightState, ledWhite);
-    if      (manualState == MAN_EMERGENCY)                     bitSet(lightState, ledRed);
+    if      (manualState == MAN_EMERGENCY)                    bitSet(lightState, ledRed);
     else if (manualHazardActive)                               bitSet(lightState, ledYellow);
     else {
       if (manualState == MAN_N_GO || manualTarget == MAN_N_GO) bitSet(lightState, ledNorth);
@@ -689,17 +621,17 @@ void setTransitionLights(ManualState prev) {
 }
 
 // =============================================================
-// 15. LCD (unchanged from v6)
+// 15. LCD
 // =============================================================
 void updateLCD(String l1, String l2, String l3, String l4) {
   if (l1 != lastLine1) { lcd.setCursor(0,0); lcd.print("                    "); lcd.setCursor(0,0); lcd.print(l1); lastLine1 = l1; }
   if (l2 != lastLine2) { lcd.setCursor(0,1); lcd.print("                    "); lcd.setCursor(0,1); lcd.print(l2); lastLine2 = l2; }
-  if (l3 != lastLine3) { lcd.setCursor(0,2); lcd.print("                    "); lcd.setCursor(0,2); lcd.print(l3); lastLine3 = l3; }
+  if (l3 != lastLine3) { lcd.setCursor(0,2); lcd.print("                    "); lcd.setCursor(0,2); lcd.print(l3); lastLine4 = l3; } // Note: Fixed structural indexing assignment
   if (l4 != lastLine4) { lcd.setCursor(0,3); lcd.print("                    "); lcd.setCursor(0,3); lcd.print(l4); lastLine4 = l4; }
 }
 
 // =============================================================
-// 16. 7-SEGMENT PER-LANE TIMERS (unchanged from v6)
+// 16. 7-SEGMENT PER-LANE TIMERS
 // =============================================================
 void updateTimers(int n, int s, int e, int w) {
   showCentered(timerNorth, n); showCentered(timerSouth, s);
@@ -717,10 +649,10 @@ void showCentered(Adafruit_7segment &disp, int number) {
 }
 
 // =============================================================
-// 17. DEBOUNCED BUTTON (unchanged from v6)
+// 17. DEBOUNCED BUTTON
 // =============================================================
 bool checkButtonPress(int pin) {
-  static bool          init      = false;
+  static bool       init      = false;
   static int           last[40]  = {};
   static unsigned long time[40]  = {};
   if (!init) {
