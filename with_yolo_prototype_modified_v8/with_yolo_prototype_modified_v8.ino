@@ -1,9 +1,11 @@
 /*
-  STAP ESP32 Controller — Firmware v7 (Yellow Countdown Display)
-  ===============================================================
-  CHANGES FOR ALL-TIMER FALLBACK:
-   - Updated runAutoFallback() to calculate wait-times for all 4 lanes
-     simultaneously instead of blanking out stopped lanes with -1.
+  STAP ESP32 Controller — Firmware v7 (Modified: No Road Yellow Display)
+  =====================================================================
+  CHANGES:
+   1. Completely removed yellowDisplay object and address constant (0x78).
+   2. Stripped tickYellowDisplay(), displayYellowCountdown(), and displayOff() 
+      so the system does not experience I2C timeouts on a missing IC.
+   3. Retained all 4 per-lane timers, zero-flicker LCD indexing, and 3-digit outputs.
 */
 
 #include <Wire.h>
@@ -27,14 +29,11 @@ const int ledEast   = 26; const int ledNorth  = 27;
 const int latchPin = 5;  const int clockPin = 18;
 const int dataPin  = 19; const int oePin    = 4;
 
-// Per-lane timer display I2C addresses (unchanged from v6)
+// Per-lane timer display I2C addresses
 #define ADDR_NORTH   0x70
 #define ADDR_SOUTH   0x72
 #define ADDR_EAST    0x74
 #define ADDR_WEST    0x76
-
-// Yellow countdown display
-#define ADDR_DISPLAY 0x78
 
 const int btnAuto      = 12; const int btnManual    = 13;
 const int btnEmergency = 14; const int btnManHazard = 26;
@@ -54,9 +53,6 @@ Adafruit_7segment timerNorth = Adafruit_7segment();
 Adafruit_7segment timerSouth = Adafruit_7segment();
 Adafruit_7segment timerEast  = Adafruit_7segment();
 Adafruit_7segment timerWest  = Adafruit_7segment();
-
-// Road-facing yellow countdown display (4-digit, shows Y  3 → Y  2 → Y  1)
-Adafruit_7segment yellowDisplay = Adafruit_7segment();
 
 uint32_t lightState = 0;
 
@@ -98,13 +94,8 @@ unsigned long lastTickMillis    = 0;
 unsigned long lastTelemetryTime = 0;
 bool          rainDetected      = false;
 
-// ── LCD dedup ─────────────────────────────────────────────────
+// ── LCD cache boundaries (Deduplication system) ───────────────
 String lastLine1 = "", lastLine2 = "", lastLine3 = "", lastLine4 = "";
-
-// ── Yellow display state ──────────────────────────────────────
-bool          displayActive          = false;
-int           displayCountdown       = 0;
-unsigned long displayLastTickMillis  = 0;
 
 // =============================================================
 // 5. MANUAL MODE STATE
@@ -138,9 +129,6 @@ void parsePythonCommand(String msg);
 void runAutoOnline(unsigned long ms);
 void runAutoFallback(unsigned long ms);
 void handleManual(unsigned long ms);
-void displayYellowCountdown(int seconds);
-void displayOff();
-void tickYellowDisplay(unsigned long ms);
 
 // =============================================================
 // 7. SETUP
@@ -159,11 +147,6 @@ void setup() {
   timerSouth.begin(ADDR_SOUTH); timerSouth.setBrightness(10);
   timerEast.begin(ADDR_EAST);   timerEast.setBrightness(10);
   timerWest.begin(ADDR_WEST);   timerWest.setBrightness(10);
-
-  // Initialize yellow countdown display
-  yellowDisplay.begin(ADDR_DISPLAY);
-  yellowDisplay.setBrightness(10);
-  displayOff(); // Start blank
 
   lcd.init(); lcd.backlight();
   updateLCD("====================", " ESP32 TRAFFIC CTRL ", "   SYSTEM BOOTING   ", "====================");
@@ -223,7 +206,6 @@ void loop() {
     manualState  = MAN_STOPPED;
     manualTarget = MAN_STOPPED;
     setAllRed();
-    displayOff(); 
   }
 
   if (currentMode == AUTO) {
@@ -240,7 +222,6 @@ void loop() {
         fallbackInYellow     = false;
         fallbackYellowStart  = 0;
         onlineSignal         = SIG_WAITING;
-        displayOff(); 
       }
     }
   }
@@ -254,8 +235,6 @@ void loop() {
         fallbackCountdown--;
     }
   }
-
-  tickYellowDisplay(ms);
 
   switch (currentMode) {
     case AUTO:
@@ -272,7 +251,6 @@ void loop() {
 // 9. PYTHON COMMAND PARSER
 // =============================================================
 void parsePythonCommand(String msg) {
-  // ── Heartbeat commands — reset timeout ──────────────────────
   if (msg.startsWith("PHASE:")   ||
       msg.startsWith("YELLOW:")  ||
       msg.startsWith("PING:")    ||
@@ -288,12 +266,10 @@ void parsePythonCommand(String msg) {
     return;
   }
 
-  // ── PING — keepalive only, no action ────────────────────────
   if (msg.startsWith("PING:")) {
     return;
   }
 
-  // ── MODE SWITCH ──────────────────────────────────────────────
   if (msg.startsWith("MODE:")) {
     String mode = msg.substring(5);
     mode.trim();
@@ -304,15 +280,12 @@ void parsePythonCommand(String msg) {
       manualState        = MAN_STOPPED;
       manualTarget       = MAN_STOPPED;
       updateShiftRegister();
-
     } else if (mode == "MANUAL") {
       currentMode  = MANUAL;
       manualState  = MAN_STOPPED;
       manualTarget = MAN_STOPPED;
       manualHazardActive = false;
       setAllRed();
-      displayOff();
-
     } else if (mode == "HAZARD") {
       currentMode        = MANUAL;
       manualHazardActive = true;
@@ -323,7 +296,6 @@ void parsePythonCommand(String msg) {
     return;
   }
 
-  // ── HAZARD per lane (flashing yellow) ───────────────────────
   if (msg.startsWith("HAZARD:")) {
     currentMode        = MANUAL;
     manualHazardActive = true;
@@ -332,8 +304,6 @@ void parsePythonCommand(String msg) {
     return;
   }
 
-  // ── MANUAL LIGHT OVERRIDE ────────────────────────────────────
-  // Format: MANUAL_LIGHT:NORTH,GREEN
   if (msg.startsWith("MANUAL_LIGHT:")) {
     String payload = msg.substring(13);
     payload.trim();
@@ -345,14 +315,11 @@ void parsePythonCommand(String msg) {
     lane.trim();
     state.trim();
 
-    // Set the correct manual state so handleManual() renders it
     if      (lane == "NORTH" && state == "GREEN")  { manualState = MAN_N_GO; setNorthGo(); }
     else if (lane == "SOUTH" && state == "GREEN")  { manualState = MAN_S_GO; setSouthGo(); }
     else if (lane == "EAST"  && state == "GREEN")  { manualState = MAN_E_GO; setEastGo();  }
     else if (lane == "WEST"  && state == "GREEN")  { manualState = MAN_W_GO; setWestGo();  }
     else if (state == "RED") {
-      // RED on a specific lane while keeping others unchanged
-      // Simplest safe behavior: all red
       manualState = MAN_STOPPED;
       setAllRed();
     }
@@ -364,8 +331,6 @@ void parsePythonCommand(String msg) {
     return;
   }
 
-  // ── EMERGENCY OVERRIDE ───────────────────────────────────────
-  // Format: EMERGENCY_OVERRIDE:NORTH
   if (msg.startsWith("EMERGENCY_OVERRIDE:")) {
     String lane = msg.substring(19);
     lane.trim();
@@ -374,33 +339,19 @@ void parsePythonCommand(String msg) {
     manualHazardActive = false;
     isOffline          = false;
 
-    // Trigger yellow on current active lane first
     onlineSignal      = SIG_YELLOW;
     yellowStartMillis = millis();
     setYellow(activeLane);
-    displayYellowCountdown(YELLOW_TIME);
 
-    // After yellow, the PHASE: command from Python will set the new lane green
-    // We just pre-set activeLane so LCD shows correct info
     activeLane = lane;
     return;
   }
 
-  // ── DISPLAY COMMAND ──────────────────────────────────────────
   if (msg.startsWith("DISPLAY:")) {
-    String payload = msg.substring(8);
-    payload.trim();
-
-    if (payload == "OFF") {
-      displayOff();
-    } else if (payload.startsWith("YELLOW,")) {
-      int seconds = payload.substring(7).toInt();
-      if (seconds > 0) displayYellowCountdown(seconds);
-    }
+    // Ignored dynamically since road-facing hardware module is not present
     return;
   }
 
-  // ── YELLOW TRANSITION ────────────────────────────────────────
   if (msg.startsWith("YELLOW:")) {
     String lane = msg.substring(7);
     lane.trim();
@@ -410,7 +361,6 @@ void parsePythonCommand(String msg) {
     return;
   }
 
-  // ── PHASE / GREEN ────────────────────────────────────────────
   if (msg.startsWith("PHASE:")) {
     if (onlineSignal == SIG_YELLOW) {
       unsigned long elapsed = millis() - yellowStartMillis;
@@ -438,52 +388,7 @@ void parsePythonCommand(String msg) {
 }
 
 // =============================================================
-// 10. YELLOW DISPLAY HELPERS
-// =============================================================
-void displayYellowCountdown(int seconds) {
-  displayActive         = true;
-  displayCountdown      = seconds;
-  displayLastTickMillis = millis();
-
-  yellowDisplay.clear();
-  yellowDisplay.writeDigitRaw(0, 0x66);  
-  yellowDisplay.writeDigitRaw(1, 0x00);  
-  yellowDisplay.writeDigitRaw(3, 0x00);  
-  yellowDisplay.writeDigitNum(4, seconds % 10); 
-  yellowDisplay.drawColon(false);
-  yellowDisplay.writeDisplay();
-}
-
-void displayOff() {
-  displayActive    = false;
-  displayCountdown = 0;
-  yellowDisplay.clear();
-  yellowDisplay.writeDisplay();
-}
-
-void tickYellowDisplay(unsigned long ms) {
-  if (!displayActive) return;
-
-  if (ms - displayLastTickMillis >= 1000) {
-    displayLastTickMillis = ms;
-    displayCountdown--;
-
-    if (displayCountdown <= 0) {
-      displayOff();
-    } else {
-      yellowDisplay.clear();
-      yellowDisplay.writeDigitRaw(0, 0x66);          
-      yellowDisplay.writeDigitRaw(1, 0x00);          
-      yellowDisplay.writeDigitRaw(3, 0x00);          
-      yellowDisplay.writeDigitNum(4, displayCountdown % 10); 
-      yellowDisplay.drawColon(false);
-      yellowDisplay.writeDisplay();
-    }
-  }
-}
-
-// =============================================================
-// 11. AUTO ONLINE MODE
+// 10. AUTO ONLINE MODE
 // =============================================================
 void runAutoOnline(unsigned long ms) {
   switch (onlineSignal) {
@@ -536,7 +441,7 @@ void runAutoOnline(unsigned long ms) {
 }
 
 // =============================================================
-// 12. AUTO FALLBACK MODE (UPDATED: ALL TIMERS SYNCED)
+// 11. AUTO FALLBACK MODE
 // =============================================================
 void runAutoFallback(unsigned long ms) {
   if (fallbackInYellow) {
@@ -551,7 +456,6 @@ void runAutoFallback(unsigned long ms) {
   if (!fallbackInYellow && fallbackCountdown <= 0) {
     fallbackInYellow    = true;
     fallbackYellowStart = ms;
-    displayYellowCountdown(YELLOW_TIME);
   }
 
   String fbLane = FALLBACK_LANE[fallbackIdx];
@@ -564,33 +468,29 @@ void runAutoFallback(unsigned long ms) {
     else if (fbLane == "WEST")  setWestGo();
   }
 
-  // Get current active lane's time footprint
   int currentRemaining = fallbackInYellow
     ? max(0, YELLOW_TIME - (int)((ms - fallbackYellowStart) / 1000))
     : fallbackCountdown;
 
-  // Compute wait-time matrix for all 4 lanes simultaneously
   int timers[4];
   for (int i = 0; i < 4; i++) {
     if (fallbackIdx == i) {
-      timers[i] = currentRemaining; // The moving lane shows its remaining green/yellow step
+      timers[i] = currentRemaining; 
     } else {
       int totalWait = currentRemaining;
       if (!fallbackInYellow) {
-        totalWait += YELLOW_TIME; // Add current lane's yellow if it's still green
+        totalWait += YELLOW_TIME; 
       }
       
-      // Cascade calculation through upcoming lanes until we hit target lane i
       int checkIdx = (fallbackIdx + 1) % 4;
       while (checkIdx != i) {
         totalWait += FALLBACK_GREEN[checkIdx] + YELLOW_TIME;
         checkIdx = (checkIdx + 1) % 4;
       }
-      timers[i] = totalWait; // Non-moving lanes display exact seconds till their green phase
+      timers[i] = totalWait; 
     }
   }
 
-  // Fire updates to all physical I2C displays
   updateTimers(timers[0], timers[1], timers[2], timers[3]);
 
   String sig  = fallbackInYellow ? "YELLOW" : "GREEN";
@@ -600,7 +500,7 @@ void runAutoFallback(unsigned long ms) {
 }
 
 // =============================================================
-// 13. MANUAL OVERRIDE
+// 12. MANUAL OVERRIDE
 // =============================================================
 void handleManual(unsigned long ms) {
   if (checkButtonPress(btnEmergency)) {
@@ -632,10 +532,10 @@ void handleManual(unsigned long ms) {
   }
 
   if (manualState != MAN_TRANSITION) {
-    if      (checkButtonPress(btnGoNorth) && manualState != MAN_N_GO) { prevManualState = manualState; manualTarget = MAN_N_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; displayYellowCountdown(YELLOW_TIME); }
-    else if (checkButtonPress(btnGoSouth) && manualState != MAN_S_GO) { prevManualState = manualState; manualTarget = MAN_S_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; displayYellowCountdown(YELLOW_TIME); }
-    else if (checkButtonPress(btnGoEast)  && manualState != MAN_E_GO) { prevManualState = manualState; manualTarget = MAN_E_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; displayYellowCountdown(YELLOW_TIME); }
-    else if (checkButtonPress(btnGoWest)  && manualState != MAN_W_GO) { prevManualState = manualState; manualTarget = MAN_W_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; displayYellowCountdown(YELLOW_TIME); }
+    if      (checkButtonPress(btnGoNorth) && manualState != MAN_N_GO) { prevManualState = manualState; manualTarget = MAN_N_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; }
+    else if (checkButtonPress(btnGoSouth) && manualState != MAN_S_GO) { prevManualState = manualState; manualTarget = MAN_S_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; }
+    else if (checkButtonPress(btnGoEast)  && manualState != MAN_E_GO) { prevManualState = manualState; manualTarget = MAN_E_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; }
+    else if (checkButtonPress(btnGoWest)  && manualState != MAN_W_GO) { prevManualState = manualState; manualTarget = MAN_W_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; }
   }
 
   if (manualState == MAN_TRANSITION) {
@@ -648,7 +548,7 @@ void handleManual(unsigned long ms) {
     else if (prevManualState == MAN_W_GO) updateTimers(-1, -1, -1, remaining);
     else                                  updateTimers(-1, -1, -1, -1);
     updateLCD("--- MANUAL MODE ---", ">> SWITCHING LANES", "Wait: " + String(remaining) + "s", "Changing active lane");
-    if (elapsed >= (long)(YELLOW_TIME * 1000)) { manualState = manualTarget; displayOff(); }
+    if (elapsed >= (long)(YELLOW_TIME * 1000)) { manualState = manualTarget; }
     return;
   }
 
@@ -660,7 +560,7 @@ void handleManual(unsigned long ms) {
 }
 
 // =============================================================
-// 14. SHIFT REGISTER & LIGHT PRESETS
+// 13. SHIFT REGISTER & LIGHT PRESETS
 // =============================================================
 void syncIndicatorLEDs() {
   lightState &= 0x0000FFFF;
@@ -718,17 +618,17 @@ void setTransitionLights(ManualState prev) {
 }
 
 // =============================================================
-// 15. LCD
+// 14. LCD
 // =============================================================
 void updateLCD(String l1, String l2, String l3, String l4) {
   if (l1 != lastLine1) { lcd.setCursor(0,0); lcd.print("                    "); lcd.setCursor(0,0); lcd.print(l1); lastLine1 = l1; }
   if (l2 != lastLine2) { lcd.setCursor(0,1); lcd.print("                    "); lcd.setCursor(0,1); lcd.print(l2); lastLine2 = l2; }
-  if (l3 != lastLine3) { lcd.setCursor(0,2); lcd.print("                    "); lcd.setCursor(0,2); lcd.print(l3); lastLine4 = l3; } // Note: Fixed structural indexing assignment
+  if (l3 != lastLine3) { lcd.setCursor(0,2); lcd.print("                    "); lcd.setCursor(0,2); lcd.print(l3); lastLine3 = l3; } 
   if (l4 != lastLine4) { lcd.setCursor(0,3); lcd.print("                    "); lcd.setCursor(0,3); lcd.print(l4); lastLine4 = l4; }
 }
 
 // =============================================================
-// 16. 7-SEGMENT PER-LANE TIMERS
+// 15. 7-SEGMENT PER-LANE TIMERS (Supports 3 Digits)
 // =============================================================
 void updateTimers(int n, int s, int e, int w) {
   showCentered(timerNorth, n); showCentered(timerSouth, s);
@@ -737,16 +637,33 @@ void updateTimers(int n, int s, int e, int w) {
 
 void showCentered(Adafruit_7segment &disp, int number) {
   if (number < 0) { disp.clear(); disp.writeDisplay(); return; }
+  
   disp.drawColon(false);
-  disp.writeDigitRaw(0, 0x00);
-  disp.writeDigitNum(1, (number / 10) % 10);
-  disp.writeDigitNum(3, number % 10);
-  disp.writeDigitRaw(4, 0x00);
+  disp.clear();
+  
+  int hundreds = (number / 100) % 10;
+  int tens     = (number / 10) % 10;
+  int units    = number % 10;
+  
+  disp.writeDigitRaw(0, 0x00); 
+  
+  if (number >= 100) {
+    disp.writeDigitNum(1, hundreds);
+    disp.writeDigitNum(3, tens);
+  } else if (number >= 10) {
+    disp.writeDigitRaw(1, 0x00); 
+    disp.writeDigitNum(3, tens);
+  } else {
+    disp.writeDigitRaw(1, 0x00); 
+    disp.writeDigitRaw(3, 0x00); 
+  }
+  
+  disp.writeDigitNum(4, units);
   disp.writeDisplay();
 }
 
 // =============================================================
-// 17. DEBOUNCED BUTTON
+// 16. DEBOUNCED BUTTON
 // =============================================================
 bool checkButtonPress(int pin) {
   static bool       init      = false;
