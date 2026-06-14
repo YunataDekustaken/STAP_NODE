@@ -9,6 +9,8 @@ CHANGES FROM v11.2:
   │  FIX: Completely removed webcam background threads. Captured and    │
   │       managed hardware frames directly inside the main loop line-by-│
   │       line, exactly reproducing the stable old code's architecture. │
+  │  FIX: Integrated new high-res toy car custom ROIs with an automated │
+  │       hardware frame scaling engine to prevent shape distortion.    │
   └─────────────────────────────────────────────────────────────────────┘
 """
 
@@ -49,17 +51,18 @@ TARGET_FPS   = 30
 DATA_TIMEOUT = 5.0
 RECONNECT_TIMEOUT = 3.0
 
-# Whole-Frame Polygon ROIs matching local lane perspective coordinates
-ROI_POLYGONS = {
-    "NORTH": np.array([[int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.2)], [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.2)], 
-                       [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.95)], [int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.95)]], dtype=np.int32),
-    "SOUTH": np.array([[int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.2)], [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.2)], 
-                       [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.95)], [int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.95)]], dtype=np.int32),
-    "EAST" : np.array([[int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.2)], [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.2)], 
-                       [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.95)], [int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.95)]], dtype=np.int32),
-    "WEST" : np.array([[int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.2)], [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.2)], 
-                       [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.95)], [int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.95)]], dtype=np.int32),
+# --- AUTOMATED REGION OF INTEREST (ROI) ENGINE FOR WEBCAMS ---
+# New high-resolution custom toy car parameters:
+RAW_HIGH_RES_ROIS = {
+    "EAST": np.array([[971, 732], [934, 2], [678, 9], [496, 745]], dtype=np.int32),
+    "NORTH": np.array([[997, 893], [343, 37], [657, 24], [1634, 918]], dtype=np.int32),
+    "SOUTH": np.array([[325, 938], [592, 0], [863, 0], [815, 953]], dtype=np.int32),
+    "WEST": np.array([[529, 26], [845, 11], [1250, 867], [629, 944]], dtype=np.int32)
 }
+
+# OpenCV Polygon allocation will compute dynamically after hardware drivers open below
+ROI_POLYGONS = {}
+# --------------------------------------------------------------------
 
 # Engineered base green times (from traffic study)
 BASE_GREEN = {"NORTH": 50, "SOUTH": 50, "EAST": 39, "WEST": 35}
@@ -182,11 +185,29 @@ count_smoother = VehicleCountSmoother(COUNT_SMOOTH_WINDOW)
 # 4. INITIALIZE HARDWARE CAMERAS SEQUENTIALLY (OLD CODE LOGIC)
 # =============================================================
 caps = []
-for idx in CAMERA_INDICES:
+print("[STAP] Opening web camera devices and calibrating aspect boundaries...")
+
+for i, idx in enumerate(CAMERA_INDICES):
+    lane = LANE_NAMES[i]
     cap = cv2.VideoCapture(idx)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAM_WIDTH)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAM_HEIGHT)
     caps.append(cap)
+    
+    # Automatically check what the hardware webcam defaults to or returns
+    hw_w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    hw_h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    
+    # Hardware validation rule for downscaling matrix logic
+    if hw_w <= 0 or hw_h <= 0:
+        hw_w, hw_h = 1920.0, 1080.0 # Standard high resolution fallback if driver isn't fully ready
+    
+    # Calculate scale factor to adapt your raw toy car coords to 640x480 space
+    poly_points = RAW_HIGH_RES_ROIS[lane].copy().astype(np.float32)
+    poly_points[:, 0] = (poly_points[:, 0] / hw_w) * CAM_WIDTH
+    poly_points[:, 1] = (poly_points[:, 1] / hw_h) * CAM_HEIGHT
+    ROI_POLYGONS[lane] = poly_points.astype(np.int32)
+    print(f"[STAP] Calibrated {lane} ROI from camera stream properties.")
 
 last_reconnect_time = [0.0, 0.0, 0.0, 0.0]
 
