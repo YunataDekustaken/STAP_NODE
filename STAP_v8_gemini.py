@@ -9,6 +9,7 @@ CHANGES FROM v11.1:
   │  FIX: Modified Fix 4 to keep fixed predictable phase rotation (protects hardware counters)
   │       but implements Micro-Phasing (7-10s) for low-occupancy lanes to maximize throughput.
   │  FIX: Added explicit 2-second All-Red Clearance Interval satisfying international standards.
+  │  FIX: Implemented Dynamic Auto-Scaling for high-resolution Region of Interest (ROI) coordinates.
 """
 
 from ultralytics import YOLO
@@ -53,14 +54,9 @@ CAM_HEIGHT   = 480
 TARGET_FPS   = 30
 DATA_TIMEOUT = 5.0
 
-# 💡 NOTE FOR FUTURE ROI UPGRADES:
-# -----------------------------------------------------------------------------------
-# To update these ROIs later using coordinates extracted from your video analyzer or tool,
-# format them exactly as standard NumPy arrays containing nested coordinate lists: [[X1, Y1], [X2, Y2], ...].
-# Ensure you enforce `dtype=np.int32` so the OpenCV detection functions do not throw calculation exceptions.
-# They can have any number of vertex points (4 points, 7 points, 9 points, etc.).
-# -----------------------------------------------------------------------------------
-ROI_POLYGONS = {
+# --- REGION OF INTEREST (ROI) CONFIGURATION & AUTO-SCALING LAYER ---
+# 1. Copy-paste future high-resolution raw ROI coordinates right here:
+RAW_HIGH_RES_ROIS = {
     "WEST": np.array([[683, 1534], [1853, 427], [2526, 424], [2748, 1605]], dtype=np.int32),
     
     "NORTH": np.array([[2173, 2159], [2109, 999], [2065, 450], [2017, 137], [1779, 134], 
@@ -71,6 +67,21 @@ ROI_POLYGONS = {
     
     "SOUTH": np.array([[579, 897], [601, 528], [869, 318], [1250, 310], [1361, 927]], dtype=np.int32)
 }
+
+# 2. Define the source video resolution canvas where your coordinates were captured.
+# For standard phone-shot videos or HD cameras, this is typically 1920x1080, 2.7K, or 4K.
+# Adjust these values if your source metadata changes.
+ORIGINAL_SOURCE_WIDTH  = 2800
+ORIGINAL_SOURCE_HEIGHT = 2200
+
+# 3. Automatic Geometry Transform Block: Maps high-res values safely into 640x480 space
+ROI_POLYGONS = {}
+for lane, polygon_points in RAW_HIGH_RES_ROIS.items():
+    scaled_points = polygon_points.copy().astype(np.float32)
+    scaled_points[:, 0] = (scaled_points[:, 0] / ORIGINAL_SOURCE_WIDTH) * CAM_WIDTH
+    scaled_points[:, 1] = (scaled_points[:, 1] / ORIGINAL_SOURCE_HEIGHT) * CAM_HEIGHT
+    ROI_POLYGONS[lane] = scaled_points.astype(np.int32)
+# --------------------------------------------------------------------
 
 # Engineered base green times (from traffic study)
 BASE_GREEN = {"NORTH": 50, "SOUTH": 50, "EAST": 39, "WEST": 35}
@@ -727,6 +738,7 @@ while True:
     for idx, lane in enumerate(LANE_NAMES):
         fr = drawn[idx]
         
+        # Enforce drawing the corrected, scaled down polygon onto the 640x480 preview window matrix
         cv2.polylines(fr, [ROI_POLYGONS[lane]], isClosed=True, color=(255,165,0), thickness=2)
 
         for b in local_boxes[lane]:
