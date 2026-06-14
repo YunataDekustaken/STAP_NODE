@@ -1,9 +1,8 @@
 """
 STAP: Smart Traffic Automation Program
 =======================================
-v18.0 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
-        with Hardware Watchdog Keepalive Pings (4000ms Fail-Safe Loop),
-        Clean Quadrant Labels, and Real-Time Spatial Occupancy Tracking.
+v18.1 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
+        with Extended Watchdog Timers and Optimized State Sync Engines.
 """
 
 from ultralytics import YOLO
@@ -77,7 +76,7 @@ LOOP_VIDEOS  = True
 CAM_WIDTH    = 640
 CAM_HEIGHT   = 480
 TARGET_FPS   = 30
-DATA_TIMEOUT = 4.0  # Aligned to exact 4.0-second Hardware Watchdog tripwire boundaries
+DATA_TIMEOUT = 6.0  # Synced to match the 6000ms hardware watchdog window exactly
 
 # --- AUTOMATED REGION OF INTEREST (ROI) ENGINE ---
 RAW_HIGH_RES_ROIS = {
@@ -707,17 +706,13 @@ def advance_phase():
     green = compute_green_time(next_lane, rain_detected)
     start_green(next_lane, green)
 
-# --- CRITICAL SYSTEM REFACTOR: CONTINUOUS KEEPALIVE TRANSMITTER ---
 def keepalive_thread():
     hub_tick = 0
     while True:
         time.sleep(PING_INTERVAL)
         with phase_lock: 
             active = PHASE_ORDER[current_phase_idx]
-        
-        # Continuous non-blocking transmission pulses feeding the hardware safety watchdog
         send_to_esp32(f"PING:{active}")
-        
         hub_tick += 1
         if hub_tick >= HUB_INTERVAL_TICKS:
             hub_tick = 0
@@ -975,9 +970,6 @@ try:
 
         cv2.imshow("STAP Analytics Dashboard", dashboard_img)
 
-        # =============================================================
-        # 10c. AUTOMATED RUN PERIODIC LEDGER EXPORT
-        # =============================================================
         if now - last_csv_log_time >= CSV_LOG_INTERVAL:
             last_csv_log_time = now
             print(f"[STAP] 🕒 Log Interval Triggered. Appending active density metrics data to ledger...")
