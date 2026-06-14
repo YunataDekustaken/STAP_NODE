@@ -1,8 +1,9 @@
 """
 STAP: Smart Traffic Automation Program
 =======================================
-v14.5 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
-        with Multi-Window UI, Transparent ROI Overlays, and Periodic Live CSV Logs.
+v15.0 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
+        with Multi-Window UI, Transparent ROI Overlays, Periodic CSV Ledger Logs,
+        and Dynamic Lane Occupancy Spatial Area Percentages.
 """
 
 from ultralytics import YOLO
@@ -50,7 +51,7 @@ LANE_NAMES  = ["NORTH", "SOUTH", "EAST", "WEST"]
 PHASE_ORDER = ["NORTH", "SOUTH", "EAST", "WEST"]
 
 # --- DYNAMIC CSV TIME MATRIX TRACKING CONFIGS ---
-CSV_LOG_INTERVAL = 300 # Periodically log counts to CSV every 300 seconds (5 minutes)
+CSV_LOG_INTERVAL = 300 # Periodically log counts and occupancy metrics to CSV every 5 minutes
 last_csv_log_time = time.time()
 
 # --- ADVANCED HUD LANE-SPECIFIC INTERSECTION COLOR REGISTERS (BGR Format) ---
@@ -86,6 +87,7 @@ RAW_HIGH_RES_ROIS = {
 }
 
 ROI_POLYGONS = {}
+ROI_STATIC_AREAS = {} # Pre-calculates exact spatial capacities in terms of pixel sizes
 print("[STAP] Calibrating matching ROI geometry scales automatically...")
 
 for idx, lane in enumerate(LANE_NAMES):
@@ -103,7 +105,12 @@ for idx, lane in enumerate(LANE_NAMES):
     poly_points = RAW_HIGH_RES_ROIS[lane].copy().astype(np.float32)
     poly_points[:, 0] = (poly_points[:, 0] / src_w) * CAM_WIDTH
     poly_points[:, 1] = (poly_points[:, 1] / src_h) * CAM_HEIGHT
-    ROI_POLYGONS[lane] = poly_points.astype(np.int32)
+    downscaled_poly = poly_points.astype(np.int32)
+    
+    ROI_POLYGONS[lane] = downscaled_poly
+    # Calculate total mathematical pixel volume inside the polygon
+    ROI_STATIC_AREAS[lane] = float(cv2.contourArea(downscaled_poly))
+    print(f"[STAP] Pre-Calculated Static Spatial Boundary Area for {lane}: {ROI_STATIC_AREAS[lane]:,.1f} Pixels")
 
 BASE_GREEN = {"NORTH": 50, "SOUTH": 50, "EAST": 39, "WEST": 35}
 
@@ -164,6 +171,9 @@ latest_frames  = [None, None, None, None]
 cached_boxes   = {lane: [] for lane in LANE_NAMES}
 vehicle_counts = {lane: 0  for lane in LANE_NAMES}
 lane_statuses  = {lane: "CLEAR" for lane in LANE_NAMES}
+
+# Dynamic Real-time Occupancy Percentage Register Buckets
+lane_live_occupancy_pct = {lane: 0.0 for lane in LANE_NAMES}
 
 analytics_lock = threading.Lock()
 global_analytics_registry = {lane: collections.defaultdict(int) for lane in LANE_NAMES}
@@ -277,11 +287,12 @@ class BackgroundAIProcessor(threading.Thread):
             print("[STAP] ⚠️ YOLO models on CPU")
 
     def run(self):
-        global cached_boxes, vehicle_counts, lane_statuses, known_classes_seen
+        global cached_boxes, vehicle_counts, lane_statuses, known_classes_seen, lane_live_occupancy_pct
         while self.running:
             temp_counts = {l: 0 for l in LANE_NAMES}
             temp_statuses = {l: "CLEAR" for l in LANE_NAMES}
             temp_boxes = {l: [] for l in LANE_NAMES}
+            temp_occupancy_pixels = {l: 0.0 for l in LANE_NAMES}
 
             for idx, lane in enumerate(LANE_NAMES):
                 img = None
@@ -333,6 +344,11 @@ class BackgroundAIProcessor(threading.Thread):
                         
                         temp_counts[lane] += 1
                         
+                        # --- DYNAMIC OCCUPANCY AREA GEOMETRY SUMMATION LAYER ---
+                        box_width = bx2 - bx1
+                        box_height = by2 - by1
+                        temp_occupancy_pixels[lane] += float(box_width * box_height)
+                        
                         if box.id is not None:
                             track_id = int(box.id[0])
                             unique_key = f"{cls_id}_{track_id}"
@@ -361,6 +377,13 @@ class BackgroundAIProcessor(threading.Thread):
                     lane: ("EMERGENCY" if emg_buffer.is_confirmed(lane) else temp_statuses[lane])
                     for lane in LANE_NAMES
                 }
+                # Calculate the percentage ratio of vehicle mass pixels to total road polygon boundaries
+                for lane in LANE_NAMES:
+                    static_total = ROI_STATIC_AREAS[lane]
+                    if static_total > 0:
+                        lane_live_occupancy_pct[lane] = min(100.0, (temp_occupancy_pixels[lane] / static_total) * 100.0)
+                    else:
+                        lane_live_occupancy_pct[lane] = 0.0
 
             time.sleep(AI_SLEEP)
 
@@ -682,7 +705,7 @@ def keepalive_thread():
             hub_tick = 0
             post_to_hub()
 
-# --- PRE-INITIALIZE FILE STRUCT WITH HEADERS TO ALLOW INTERMEDIATE APPENDS ---
+# --- PRE-INITIALIZE FILE STRUCT WITH HEADERS ---
 CSV_PATH = os.path.join(CURRENT_RUN_DIR, "traffic_summary.csv")
 with open(CSV_PATH, mode='w', newline='', encoding='utf-8') as f:
     writer = csv.writer(f)
@@ -702,7 +725,7 @@ start_green(_first_lane, _first_green)
 # --- INITIALIZE MULTI-WINDOW SYSTEMS ---
 cv2.namedWindow("STAP Local Engine Monitor", cv2.WINDOW_NORMAL)
 cv2.namedWindow("STAP Analytics Dashboard", cv2.WINDOW_NORMAL)
-cv2.resizeWindow("STAP Analytics Dashboard", 550, 400)
+cv2.resizeWindow("STAP Analytics Dashboard", 650, 420)
 
 GRID_WIDTH  = CAM_WIDTH * 2
 GRID_HEIGHT = CAM_HEIGHT * 2
@@ -727,6 +750,7 @@ try:
             local_boxes    = {k: list(v) for k, v in cached_boxes.items()}
             local_counts   = vehicle_counts.copy()
             local_statuses = lane_statuses.copy()
+            local_occupancy = lane_live_occupancy_pct.copy() # Safe snapshot fetch
 
         with phase_lock:
             snap_lane    = PHASE_ORDER[current_phase_idx]
@@ -773,8 +797,11 @@ try:
             with analytics_lock:
                 lane_lifetime_total = sum(global_analytics_registry[lane].values())
 
-            cv2.putText(fr, f"APPROACH: {lane} | LOS: {los} | QUEUE: {local_counts[lane]}",
-                        (8, CAM_HEIGHT-28), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255,255,255), 1)
+            # Print spatial density metrics directly inside the HUD layer matrix layout channels
+            cv2.putText(fr, f"APPROACH: {lane} | LOS: {los} | LIVE QUEUE: {local_counts[lane]}",
+                        (8, CAM_HEIGHT-42), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255,255,255), 1)
+            cv2.putText(fr, f"ROI SPATIAL DENSITY: {local_occupancy[lane]:.1f}%",
+                        (8, CAM_HEIGHT-26), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
             cv2.putText(fr, f"G:{adj}s(base:{base}s) R:{red}s | LOGGED UNIQUE:{lane_lifetime_total}",
                         (8, CAM_HEIGHT-12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200,255,200), 1)
 
@@ -810,19 +837,19 @@ try:
         # =============================================================
         # 10b. GENERATE DEDICATED POP-UP SCOREBOARD UI WINDOW
         # =============================================================
-        db_w, db_h = 550, 400
+        db_w, db_h = 650, 420
         dashboard_img = np.zeros((db_h, db_w, 3), dtype=np.uint8)
         cv2.rectangle(dashboard_img, (0, 0), (db_w, db_h), (24, 24, 24), -1)
         cv2.rectangle(dashboard_img, (10, 10), (db_w-10, 50), (40, 40, 40), -1)
         
-        # Display localized visual cue mapping log intervals remaining inside HUD
         secs_to_next_log = max(0, int(CSV_LOG_INTERVAL - (now - last_csv_log_time)))
-        cv2.putText(dashboard_img, f"STAP LIVE VEHICLE ANALYTICS ENGINE [CSV LOG: {secs_to_next_log}s]", (20, 36), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 2)
+        cv2.putText(dashboard_img, f"STAP LIVE DENSITY ANALYTICS DASHBOARD [CSV LOG: {secs_to_next_log}s]", (20, 36), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (0, 255, 255), 2)
 
         with analytics_lock:
             classes_to_render = sorted(list(known_classes_seen))
-            cv2.putText(dashboard_img, f"{'CLASS':<15}{'NORTH':<8}{'SOUTH':<8}{'EAST':<8}{'WEST':<8}{'TOTAL':<6}", 
+            # Format includes Density markers dynamically inside tabular grids
+            cv2.putText(dashboard_img, f"{'CLASS':<14}{'NORTH':<8}{'SOUTH':<8}{'EAST':<8}{'WEST':<8}{'TOTAL':<6}", 
                         (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1)
             cv2.line(dashboard_img, (15, 95), (db_w-15, 95), (70, 70, 70), 1)
 
@@ -843,13 +870,23 @@ try:
                 class_column_totals["WEST"] += w_v
                 grand_total_all_lanes += row_sum
 
-                row_text = f"{cls_name[:12]:<15}{n_v:<8}{s_v:<8}{e_v:<8}{w_v:<8}{row_sum:<6}"
+                row_text = f"{cls_name[:11]:<14}{n_v:<8}{s_v:<8}{e_v:<8}{w_v:<8}{row_sum:<6}"
                 cv2.putText(dashboard_img, row_text, (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
                 y_pos += 22
-                if y_pos > db_h - 60: break 
+                if y_pos > db_h - 90: break 
+
+            cv2.line(dashboard_img, (15, db_h-75), (db_w-15, db_h-75), (55, 55, 55), 1)
+            
+            # Map dynamic active lane spatial queue metrics layout rows
+            density_row = f"{'LIVE DENSITY':<14}"\
+                          f"{local_occupancy['NORTH']:.1f}%  "\
+                          f"{local_occupancy['SOUTH']:.1f}%  "\
+                          f"{local_occupancy['EAST']:.1f}%  "\
+                          f"{local_occupancy['WEST']:.1f}%  "
+            cv2.putText(dashboard_img, density_row, (20, db_h-55), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 215, 255), 1)
 
             cv2.line(dashboard_img, (15, db_h-45), (db_w-15, db_h-45), (0, 255, 255), 1)
-            footer_text = f"{'GRAND TOTAL':<15}"\
+            footer_text = f"{'GRAND TOTAL':<14}"\
                           f"{class_column_totals['NORTH']:<8}"\
                           f"{class_column_totals['SOUTH']:<8}"\
                           f"{class_column_totals['EAST']:<8}"\
@@ -864,7 +901,7 @@ try:
         # =============================================================
         if now - last_csv_log_time >= CSV_LOG_INTERVAL:
             last_csv_log_time = now
-            print(f"[STAP] 🕒 Log Interval Triggered. Appending active metrics chunk data block to ledger...")
+            print(f"[STAP] 🕒 Log Interval Triggered. Appending active density metrics data to ledger...")
             
             with analytics_lock:
                 try:
@@ -873,7 +910,7 @@ try:
                         current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         
                         writer.writerow([f"--- INTERVAL RECORDING SNAPSHOT [{current_timestamp}] ---"])
-                        writer.writerow(["Lane Approach"] + classes_to_render + ["Cumulative Lane Vector Total"])
+                        writer.writerow(["Lane Approach"] + classes_to_render + ["Cumulative Total", "Live Area Density Occupancy %"])
                         
                         for lane in LANE_NAMES:
                             lane_row = [lane]
@@ -883,14 +920,14 @@ try:
                                 lane_row.append(val)
                                 lane_sum += val
                             lane_row.append(lane_sum)
+                            lane_row.append(f"{local_occupancy[lane]:.2f}%")
                             writer.writerow(lane_row)
                             
-                        # Add a quick structural spacer buffer string row entry block line segment
-                        writer.writerow(["Intersection Total Unique Sum At This Mark:", grand_total_all_lanes])
+                        writer.writerow(["Intersection Cumulative Unique Vehicles Sum:", grand_total_all_lanes])
                         writer.writerow([])
-                    print("[STAP] ✅ Intermediate log appended successfully.")
+                    print("[STAP] ✅ Density interval logging cycle complete.")
                 except Exception as csv_append_err:
-                    print(f"[STAP] ⚠️ Delayed appending snapshot chunk buffer: {csv_append_err}")
+                    print(f"[STAP] ⚠️ Delayed appending metrics block: {csv_append_err}")
 
         for idx, lane in enumerate(LANE_NAMES):
             with lane_stream_locks[lane]:
@@ -916,7 +953,7 @@ try:
 
 finally:
     # =============================================================
-    # 11. CLEANUP EXITS & FINAL ABSOLUTE GRAND TOTALS OVERVIEW REPORT
+    # 11. CLEANUP EXITS & FINAL ABSOLUTE GRAND TOTALS SUMMARY REPORT
     # =============================================================
     print("\n[STAP] 🛑 Shutdown Signal Intercepted. Closing background modules cleanly...")
     
@@ -925,7 +962,7 @@ finally:
     video_writer.release()
     cv2.destroyAllWindows()
     
-    print(f"[STAP] 📊 Compiling absolute summary total arrays sheet into ledger -> {CSV_PATH}")
+    print(f"[STAP] 📊 Compiling absolute density data frames into master sheet ledger -> {CSV_PATH}")
     
     with analytics_lock:
         all_detected_classes = sorted(list(known_classes_seen))
@@ -937,7 +974,7 @@ finally:
                 writer.writerow(["Session Termination Completed Clock", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
                 writer.writerow([])
                 
-                header_row = ["Approach Lane Name"] + all_detected_classes + ["Absolute Grand Unique Count"]
+                header_row = ["Approach Lane Name"] + all_detected_classes + ["Absolute Grand Unique Count", "Final Snapshot Road Density"]
                 writer.writerow(header_row)
                 
                 class_grand_totals = collections.defaultdict(int)
@@ -952,6 +989,7 @@ finally:
                         lane_sum += val
                         class_grand_totals[cls_name] += val
                     row.append(lane_sum)
+                    row.append(f"{local_occupancy[lane]:.2f}%")
                     intersection_grand_total += lane_sum
                     writer.writerow(row)
                 
@@ -961,8 +999,8 @@ finally:
                 totals_row.append(intersection_grand_total)
                 writer.writerow(totals_row)
                 
-            print(f"[STAP] ✅ Data Export successful. Total unique intersection-wide vehicles logged: {intersection_grand_total}")
+            print(f"[STAP] ✅ Master Data Export successful. Total unique intersection vehicles logged: {intersection_grand_total}")
         except Exception as csv_err:
-            print(f"[STAP] ❌ Failed to write final CSV metrics rows: {csv_err}")
+            print(f"[STAP] ❌ Failed to compile final absolute metrics spreadsheet rows: {csv_err}")
             
     print(f"[STAP] Run complete. Check folder path '{CURRENT_RUN_DIR}' for all generated session files.")
