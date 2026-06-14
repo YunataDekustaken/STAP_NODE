@@ -1,11 +1,8 @@
 /*
-  STAP ESP32 Controller — Firmware v7 (Modified: No Road Yellow Display)
+  STAP ESP32 Controller — Firmware v17.5 (Synchronized Feedback Engine)
   =====================================================================
-  CHANGES:
-   1. Completely removed yellowDisplay object and address constant (0x78).
-   2. Stripped tickYellowDisplay(), displayYellowCountdown(), and displayOff() 
-      so the system does not experience I2C timeouts on a missing IC.
-   3. Retained all 4 per-lane timers, zero-flicker LCD indexing, and 3-digit outputs.
+  Natively broadcasts absolute hardware light states back across the 
+  serial channel during Manual Mode triggers to synchronize virtual HUDs.
 */
 
 #include <Wire.h>
@@ -129,6 +126,7 @@ void parsePythonCommand(String msg);
 void runAutoOnline(unsigned long ms);
 void runAutoFallback(unsigned long ms);
 void handleManual(unsigned long ms);
+void broadcastManualStates();
 
 // =============================================================
 // 7. SETUP
@@ -176,6 +174,10 @@ void loop() {
       "RAIN:" + String(rainDetected ? "1" : "0") +
       ",MODE:" + String(currentMode == MANUAL ? "MANUAL" : "AUTO")
     );
+    // Explicitly pulse manual lamp verification updates back down stream channels
+    if (currentMode == MANUAL) {
+      broadcastManualStates();
+    }
     Serial.flush();
   }
 
@@ -206,6 +208,7 @@ void loop() {
     manualState  = MAN_STOPPED;
     manualTarget = MAN_STOPPED;
     setAllRed();
+    broadcastManualStates();
   }
 
   if (currentMode == AUTO) {
@@ -248,7 +251,7 @@ void loop() {
 }
 
 // =============================================================
-// 9. PYTHON COMMAND PARSER
+// 9. PYTHON COMMAND PARSER (With Verification Streaming Echoes)
 // =============================================================
 void parsePythonCommand(String msg) {
   if (msg.startsWith("PHASE:")   ||
@@ -286,6 +289,7 @@ void parsePythonCommand(String msg) {
       manualTarget = MAN_STOPPED;
       manualHazardActive = false;
       setAllRed();
+      broadcastManualStates();
     } else if (mode == "HAZARD") {
       currentMode        = MANUAL;
       manualHazardActive = true;
@@ -328,6 +332,7 @@ void parsePythonCommand(String msg) {
     }
 
     updateTimers(-1, -1, -1, -1);
+    broadcastManualStates(); // Send absolute verification echoes back instantly
     return;
   }
 
@@ -348,7 +353,6 @@ void parsePythonCommand(String msg) {
   }
 
   if (msg.startsWith("DISPLAY:")) {
-    // Ignored dynamically since road-facing hardware module is not present
     return;
   }
 
@@ -380,7 +384,7 @@ void parsePythonCommand(String msg) {
     }
     lane.trim();
 
-    activeLane     = lane;
+    activeLane = lane;
     greenCountdown = duration;
     onlineSignal   = SIG_GREEN;
     return;
@@ -511,6 +515,7 @@ void handleManual(unsigned long ms) {
       manualState = MAN_EMERGENCY; manualTarget = MAN_STOPPED;
       manualHazardActive = false; updateShiftRegister();
     }
+    broadcastManualStates();
   }
   if (manualState == MAN_EMERGENCY) {
     setAllRed(); updateTimers(-1, -1, -1, -1);
@@ -522,6 +527,7 @@ void handleManual(unsigned long ms) {
     manualHazardActive = !manualHazardActive;
     if (manualHazardActive) { manualState = MAN_STOPPED; manualTarget = MAN_STOPPED; }
     updateShiftRegister();
+    broadcastManualStates();
   }
   if (manualHazardActive) {
     if ((ms / 500) % 2 == 0) blinkYellows();
@@ -536,6 +542,7 @@ void handleManual(unsigned long ms) {
     else if (checkButtonPress(btnGoSouth) && manualState != MAN_S_GO) { prevManualState = manualState; manualTarget = MAN_S_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; }
     else if (checkButtonPress(btnGoEast)  && manualState != MAN_E_GO) { prevManualState = manualState; manualTarget = MAN_E_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; }
     else if (checkButtonPress(btnGoWest)  && manualState != MAN_W_GO) { prevManualState = manualState; manualTarget = MAN_W_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; }
+    if (manualState == MAN_TRANSITION) broadcastManualStates();
   }
 
   if (manualState == MAN_TRANSITION) {
@@ -548,7 +555,10 @@ void handleManual(unsigned long ms) {
     else if (prevManualState == MAN_W_GO) updateTimers(-1, -1, -1, remaining);
     else                                  updateTimers(-1, -1, -1, -1);
     updateLCD("--- MANUAL MODE ---", ">> SWITCHING LANES", "Wait: " + String(remaining) + "s", "Changing active lane");
-    if (elapsed >= (long)(YELLOW_TIME * 1000)) { manualState = manualTarget; }
+    if (elapsed >= (long)(YELLOW_TIME * 1000)) { 
+      manualState = manualTarget; 
+      broadcastManualStates();
+    }
     return;
   }
 
@@ -557,6 +567,25 @@ void handleManual(unsigned long ms) {
   else if (manualState == MAN_E_GO) { setEastGo();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: EAST",  "Manual override act.", "Select next lane ->"); }
   else if (manualState == MAN_W_GO) { setWestGo();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: WEST",  "Manual override act.", "Select next lane ->"); }
   else                              { setAllRed();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> REMOTE CONTROL", "All lanes RED", "Awaiting command..."); }
+}
+
+// =============================================================
+// 12b. EXPLICIT HARDWARE LIGHT STATE BROADCASTER
+// =============================================================
+void broadcastManualStates() {
+  // Evaluates exactly which shift register bits are active and prints the matching status
+  String lanes[] = {"NORTH", "SOUTH", "EAST", "WEST"};
+  int greens[]   = {N_GREEN, S_GREEN, E_GREEN, W_GREEN};
+  int yellows[]  = {N_YELLOW, S_YELLOW, E_YELLOW, W_YELLOW};
+  
+  for (int i = 0; i < 4; i++) {
+    String currentLamp = "RED";
+    if (bitRead(lightState, greens[i]))       currentLamp = "GREEN";
+    else if (bitRead(lightState, yellows[i])) currentLamp = "YELLOW";
+    
+    Serial.println("STATE:" + lanes[i] + "," + currentLamp);
+  }
+  Serial.flush();
 }
 
 // =============================================================
@@ -637,7 +666,6 @@ void updateTimers(int n, int s, int e, int w) {
 
 void showCentered(Adafruit_7segment &disp, int number) {
   if (number < 0) { disp.clear(); disp.writeDisplay(); return; }
-  
   disp.drawColon(false);
   disp.clear();
   
@@ -646,7 +674,6 @@ void showCentered(Adafruit_7segment &disp, int number) {
   int units    = number % 10;
   
   disp.writeDigitRaw(0, 0x00); 
-  
   if (number >= 100) {
     disp.writeDigitNum(1, hundreds);
     disp.writeDigitNum(3, tens);
@@ -657,7 +684,6 @@ void showCentered(Adafruit_7segment &disp, int number) {
     disp.writeDigitRaw(1, 0x00); 
     disp.writeDigitRaw(3, 0x00); 
   }
-  
   disp.writeDigitNum(4, units);
   disp.writeDisplay();
 }
