@@ -1,8 +1,8 @@
 """
 STAP: Smart Traffic Automation Program
 =======================================
-v14.0 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
-        with Lane-Specific Transparent ROI Alpha-Blended HUD Overlays.
+v14.5 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
+        with Multi-Window UI, Transparent ROI Overlays, and Periodic Live CSV Logs.
 """
 
 from ultralytics import YOLO
@@ -49,6 +49,10 @@ VEHICLE_CLASS_IDS   = [1, 2, 3, 4, 6, 7, 8, 10, 11, 12, 13]
 LANE_NAMES  = ["NORTH", "SOUTH", "EAST", "WEST"]
 PHASE_ORDER = ["NORTH", "SOUTH", "EAST", "WEST"]
 
+# --- DYNAMIC CSV TIME MATRIX TRACKING CONFIGS ---
+CSV_LOG_INTERVAL = 300 # Periodically log counts to CSV every 300 seconds (5 minutes)
+last_csv_log_time = time.time()
+
 # --- ADVANCED HUD LANE-SPECIFIC INTERSECTION COLOR REGISTERS (BGR Format) ---
 ROI_COLORS = {
     "NORTH": (255, 255, 0),    # Cyan
@@ -56,7 +60,7 @@ ROI_COLORS = {
     "EAST": (0, 255, 255),     # Yellow
     "WEST": (255, 0, 255)      # Magenta
 }
-ROI_ALPHA = 0.15 # 15% opacity transparency factor level for the overlay polygon mask fill
+ROI_ALPHA = 0.15 
 
 VIDEO_FILES = [
     r"C:\Users\Raphael\Desktop\YOLO\FINAL\13_North.MOV",
@@ -343,7 +347,7 @@ class BackgroundAIProcessor(threading.Thread):
                         temp_boxes[lane].append({
                             "coords": (bx1, by1, bx2, by2),
                             "label" : f"{self.labels.get(cls_id, 'Vehicle')} {conf:.2f}",
-                            "color" : (0, 0, 255) if is_emg else ROI_COLORS[lane], # Match box text to lane color registry
+                            "color" : (0, 0, 255) if is_emg else ROI_COLORS[lane],
                         })
 
             for lane in LANE_NAMES:
@@ -678,6 +682,14 @@ def keepalive_thread():
             hub_tick = 0
             post_to_hub()
 
+# --- PRE-INITIALIZE FILE STRUCT WITH HEADERS TO ALLOW INTERMEDIATE APPENDS ---
+CSV_PATH = os.path.join(CURRENT_RUN_DIR, "traffic_summary.csv")
+with open(CSV_PATH, mode='w', newline='', encoding='utf-8') as f:
+    writer = csv.writer(f)
+    writer.writerow(["STAP DYNAMIC REAL-TIME TIMESTAMED LEDGER LOG"])
+    writer.writerow(["Session Start Initialization Time", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+    writer.writerow([])
+
 threading.Thread(target=keepalive_thread, daemon=True).start()
 threading.Thread(target=hub_heartbeat_thread, daemon=True).start()
 threading.Thread(target=run_flask_server, daemon=True).start() 
@@ -743,15 +755,9 @@ try:
             fr = drawn[idx]
             lane_color = ROI_COLORS[lane]
 
-            # --- ENGINE ARCHITECTURE FOR TRANSPARENT ROI BLENDING ---
-            # Create a clone of the original frame matrix to act as the transparency draw surface
             overlay = fr.copy()
-            # Draw a solid polygon using the specific color assigned to the lane
             cv2.fillPoly(overlay, [ROI_POLYGONS[lane]], lane_color)
-            # Mathematically blend the solid overlay back onto the live stream frame
             cv2.addWeighted(overlay, ROI_ALPHA, fr, 1.0 - ROI_ALPHA, 0, fr)
-
-            # Draw the clean perimeter outline edge directly on top of the alpha fill area
             cv2.polylines(fr, [ROI_POLYGONS[lane]], isClosed=True, color=lane_color, thickness=2)
 
             for b in local_boxes[lane]:
@@ -788,8 +794,8 @@ try:
             cv2.putText(fr, status_text, (8, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, sc, 2)
 
         grid = np.vstack((np.hstack((drawn[0], drawn[1])), np.hstack((drawn[2], drawn[3]))))
-        hud_color  = (0, 255, 255)
         mode_label = "OFFLINE/FALLBACK" if is_offline else ("MANUAL OVERRIDE" if manual_override else "AUTO (SMART AI)")
+        hud_color  = (0, 255, 255)
         if any(v == "EMERGENCY" for v in local_statuses.values()):
             mode_label = "!!! EMERGENCY PREEMPTION ACTIVE !!!"; hud_color = (0, 0, 255)
         elif rain_detected: mode_label += " + CONDITIONAL RAIN BUFFERS"
@@ -808,8 +814,11 @@ try:
         dashboard_img = np.zeros((db_h, db_w, 3), dtype=np.uint8)
         cv2.rectangle(dashboard_img, (0, 0), (db_w, db_h), (24, 24, 24), -1)
         cv2.rectangle(dashboard_img, (10, 10), (db_w-10, 50), (40, 40, 40), -1)
-        cv2.putText(dashboard_img, "STAP LIVE VEHICLE ANALYTICS ENGINE", (25, 36), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+        
+        # Display localized visual cue mapping log intervals remaining inside HUD
+        secs_to_next_log = max(0, int(CSV_LOG_INTERVAL - (now - last_csv_log_time)))
+        cv2.putText(dashboard_img, f"STAP LIVE VEHICLE ANALYTICS ENGINE [CSV LOG: {secs_to_next_log}s]", (20, 36), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 255, 255), 2)
 
         with analytics_lock:
             classes_to_render = sorted(list(known_classes_seen))
@@ -850,6 +859,39 @@ try:
 
         cv2.imshow("STAP Analytics Dashboard", dashboard_img)
 
+        # =============================================================
+        # 10c. AUTOMATED RUN PERIODIC LEDGER EXPORT CONDITION ENGINE
+        # =============================================================
+        if now - last_csv_log_time >= CSV_LOG_INTERVAL:
+            last_csv_log_time = now
+            print(f"[STAP] 🕒 Log Interval Triggered. Appending active metrics chunk data block to ledger...")
+            
+            with analytics_lock:
+                try:
+                    with open(CSV_PATH, mode='a', newline='', encoding='utf-8') as f:
+                        writer = csv.writer(f)
+                        current_timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        
+                        writer.writerow([f"--- INTERVAL RECORDING SNAPSHOT [{current_timestamp}] ---"])
+                        writer.writerow(["Lane Approach"] + classes_to_render + ["Cumulative Lane Vector Total"])
+                        
+                        for lane in LANE_NAMES:
+                            lane_row = [lane]
+                            lane_sum = 0
+                            for cls_name in classes_to_render:
+                                val = global_analytics_registry[lane].get(cls_name, 0)
+                                lane_row.append(val)
+                                lane_sum += val
+                            lane_row.append(lane_sum)
+                            writer.writerow(lane_row)
+                            
+                        # Add a quick structural spacer buffer string row entry block line segment
+                        writer.writerow(["Intersection Total Unique Sum At This Mark:", grand_total_all_lanes])
+                        writer.writerow([])
+                    print("[STAP] ✅ Intermediate log appended successfully.")
+                except Exception as csv_append_err:
+                    print(f"[STAP] ⚠️ Delayed appending snapshot chunk buffer: {csv_append_err}")
+
         for idx, lane in enumerate(LANE_NAMES):
             with lane_stream_locks[lane]:
                 global_lane_frames[lane] = drawn[idx].copy()
@@ -874,7 +916,7 @@ try:
 
 finally:
     # =============================================================
-    # 11. CLEANUP EXITS & DATA ANALYTICS SHEET GENERATION
+    # 11. CLEANUP EXITS & FINAL ABSOLUTE GRAND TOTALS OVERVIEW REPORT
     # =============================================================
     print("\n[STAP] 🛑 Shutdown Signal Intercepted. Closing background modules cleanly...")
     
@@ -883,19 +925,19 @@ finally:
     video_writer.release()
     cv2.destroyAllWindows()
     
-    CSV_PATH = os.path.join(CURRENT_RUN_DIR, "traffic_summary.csv")
-    print(f"[STAP] 📊 Compiling vehicle metrics data sheets -> {CSV_PATH}")
+    print(f"[STAP] 📊 Compiling absolute summary total arrays sheet into ledger -> {CSV_PATH}")
     
     with analytics_lock:
         all_detected_classes = sorted(list(known_classes_seen))
         try:
-            with open(CSV_PATH, mode='w', newline='', encoding='utf-8') as f:
+            with open(CSV_PATH, mode='a', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(["Traffic Metric Summary Report"])
-                writer.writerow(["Timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+                writer.writerow(["========================================================="])
+                writer.writerow(["FINAL INTERSECTION REPORT SUMMARY MATRIX"])
+                writer.writerow(["Session Termination Completed Clock", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
                 writer.writerow([])
                 
-                header_row = ["Approach Lane"] + all_detected_classes + ["Total Unique Count"]
+                header_row = ["Approach Lane Name"] + all_detected_classes + ["Absolute Grand Unique Count"]
                 writer.writerow(header_row)
                 
                 class_grand_totals = collections.defaultdict(int)
@@ -913,7 +955,7 @@ finally:
                     intersection_grand_total += lane_sum
                     writer.writerow(row)
                 
-                totals_row = ["TOTAL INTERSECTION"]
+                totals_row = ["TOTAL INTERSECTION CORRIDOR"]
                 for cls_name in all_detected_classes:
                     totals_row.append(class_grand_totals[cls_name])
                 totals_row.append(intersection_grand_total)
@@ -921,6 +963,6 @@ finally:
                 
             print(f"[STAP] ✅ Data Export successful. Total unique intersection-wide vehicles logged: {intersection_grand_total}")
         except Exception as csv_err:
-            print(f"[STAP] ❌ Failed to write CSV file: {csv_err}")
+            print(f"[STAP] ❌ Failed to write final CSV metrics rows: {csv_err}")
             
     print(f"[STAP] Run complete. Check folder path '{CURRENT_RUN_DIR}' for all generated session files.")
