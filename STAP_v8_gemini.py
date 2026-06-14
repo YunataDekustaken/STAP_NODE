@@ -1,15 +1,8 @@
 """
 STAP: Smart Traffic Automation Program
 =======================================
-v12.0 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture.
-
-CHANGES FROM v11.1:
-  │  FIX: Reduced MAX_ADJUSTMENT to 10s and lowered congestion safety threshold to 20.
-  │  FIX: Conditional rain buffer applied only to highly congested approaches (LOS D/E/F).
-  │  FIX: Modified Fix 4 to keep fixed predictable phase rotation (protects hardware counters)
-  │       but implements Micro-Phasing (7-10s) for low-occupancy lanes to maximize throughput.
-  │  FIX: Added explicit 2-second All-Red Clearance Interval satisfying international standards.
-  │  FIX: Implemented Dynamic Auto-Scaling for high-resolution Region of Interest (ROI) coordinates.
+v13.0 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
+        with Class-Specific Tracking Data Export & Session Video Logging.
 """
 
 from ultralytics import YOLO
@@ -22,8 +15,23 @@ import threading
 import torch
 import os
 import collections
+import csv
 from datetime import datetime
 from flask import Flask, Response, request, jsonify
+
+# =============================================================
+# 0. AUTO-INCREMENTING RUN DIRECTORY & VIDEO WRITER SETUP
+# =============================================================
+BASE_RUNS_DIR = "runs"
+os.makedirs(BASE_RUNS_DIR, exist_ok=True)
+
+run_idx = 1
+while os.path.exists(os.path.join(BASE_RUNS_DIR, f"run_{run_idx}")):
+    run_idx += 1
+
+CURRENT_RUN_DIR = os.path.join(BASE_RUNS_DIR, f"run_{run_idx}")
+os.makedirs(CURRENT_RUN_DIR, exist_ok=True)
+print(f"[STAP] 📂 Initialized Session Storage Directory: {CURRENT_RUN_DIR}")
 
 # =============================================================
 # 1. CONFIGURATION & FLASK SERVER BOOT
@@ -55,16 +63,12 @@ TARGET_FPS   = 30
 DATA_TIMEOUT = 5.0
 
 # --- AUTOMATED REGION OF INTEREST (ROI) ENGINE ---
-# Your raw high-resolution custom coordinates:
 RAW_HIGH_RES_ROIS = {
     "WEST": np.array([[683, 1534], [1853, 427], [2526, 424], [2748, 1605]], dtype=np.int32),
-    
     "NORTH": np.array([[2173, 2159], [2109, 999], [2065, 450], [2017, 137], [1779, 134], 
                        [1567, 464], [991, 1263], [497, 1880], [761, 2155]], dtype=np.int32),
-    
     "EAST": np.array([[7, 1713], [-1, 1181], [683, 528], [932, 320], [1181, 175], 
                       [1835, 175], [2303, 1735]], dtype=np.int32),
-    
     "SOUTH": np.array([[579, 897], [601, 528], [869, 318], [1250, 310], [1361, 927]], dtype=np.int32)
 }
 
@@ -72,54 +76,46 @@ ROI_POLYGONS = {}
 print("[STAP] Calibrating matching ROI geometry scales automatically...")
 
 for idx, lane in enumerate(LANE_NAMES):
-    # Dynamically read the true width and height of each video file to avoid skewing
     test_cap = cv2.VideoCapture(VIDEO_FILES[idx])
     src_w = test_cap.get(cv2.CAP_PROP_FRAME_WIDTH)
     src_h = test_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
     test_cap.release()
     
-    # Check if video opened successfully, otherwise fallback to standard 1080p
     if src_w <= 0 or src_h <= 0:
         src_w, src_h = 1920.0, 1080.0
         print(f"[STAP] ⚠️ Unable to read video dimensions for {lane}. Using fallback 1920x1080.")
     else:
         print(f"[STAP] Direct mapping calibrated for {lane}: Source ({int(src_w)}x{int(src_h)}) -> Process Target ({CAM_WIDTH}x{CAM_HEIGHT})")
 
-    # Run calculation to perfectly map original dimensions into 640x480 container footprint
     poly_points = RAW_HIGH_RES_ROIS[lane].copy().astype(np.float32)
     poly_points[:, 0] = (poly_points[:, 0] / src_w) * CAM_WIDTH
     poly_points[:, 1] = (poly_points[:, 1] / src_h) * CAM_HEIGHT
     ROI_POLYGONS[lane] = poly_points.astype(np.int32)
-# --------------------------------------------------------------------
 
-# Engineered base green times (from traffic study)
 BASE_GREEN = {"NORTH": 50, "SOUTH": 50, "EAST": 39, "WEST": 35}
 
-# International Standards Compliance Configuration Blocks
-YELLOW_TIME       = 3     # Visual countdown baseline
-ALL_RED_TIME      = 2     # Vienna Convention clearance buffer
-CONGESTION_CEILING= 20    # Optimization safety check trigger threshold (Fix 2)
+YELLOW_TIME        = 3 
+ALL_RED_TIME       = 2 
+CONGESTION_CEILING = 20 
 
 MIN_GREEN       = {lane: max(7,  int(BASE_GREEN[lane] * 0.40)) for lane in LANE_NAMES}
 MAX_GREEN       = {lane: min(65, int(BASE_GREEN[lane] * 1.30)) for lane in LANE_NAMES}
-MAX_ADJUSTMENT  = 10     # Tighter extension bounding rule (Fix 1)
+MAX_ADJUSTMENT  = 10 
 
 LOS_THRESHOLDS = [("A",0,1),("B",2,3),("C",4,6),("D",7,10),("E",11,15),("F",16,999)]
 LOS_DELTA      = {"A":-10,"B":-6,"C":0,"D":+6,"E":+8,"F":+10}
 
 PING_INTERVAL = 0.4
 
-# Detection Stability Tuning
-CONF_THRESHOLD            = 0.50   
-EMERGENCY_SUSTAIN_SECONDS = 3.0    
-COUNT_SMOOTH_WINDOW       = 8      
+CONF_THRESHOLD            = 0.50 
+EMERGENCY_SUSTAIN_SECONDS = 3.0 
+COUNT_SMOOTH_WINDOW       = 8 
 
-# STAP Hub Public Cloud Endpoints
 NODE_API_KEY       = "node_alpha_J7FVxdRBqwCBWQSdiKBN742lMHuEPX5A"
 STAP_HUB_URL       = "https://your-free-webapp.render.com/api/v1/snapshots"
 STAP_HEARTBEAT_URL = "https://your-free-webapp.render.com/api/v1/heartbeat"
 HUB_ENABLED        = True
-HUB_INTERVAL_TICKS = 75  
+HUB_INTERVAL_TICKS = 75 
 
 CAMERA_MAP = {"NORTH": 1, "SOUTH": 2, "EAST": 3, "WEST": 4}
 CONGESTION_MAP = {"A": "A", "B": "B", "C": "C", "D": "D", "E": "E", "F": "F"}
@@ -140,7 +136,7 @@ if torch.cuda.is_available():
 else:
     DEVICE   = "cpu"
     AI_SLEEP = 0.15
-    print("[STAP] ⚠️  CPU Mode — install CUDA PyTorch for better performance")
+    print("[STAP] ⚠️ CPU Mode — install CUDA PyTorch for better performance")
 
 # =============================================================
 # 3. THREAD-SAFE STORAGE & LOCKS
@@ -156,9 +152,13 @@ cached_boxes   = {lane: [] for lane in LANE_NAMES}
 vehicle_counts = {lane: 0  for lane in LANE_NAMES}
 lane_statuses  = {lane: "CLEAR" for lane in LANE_NAMES}
 
+# Lifetime Unique Object Analytics Tracker Engine
+analytics_lock = threading.Lock()
+global_analytics_registry = {lane: collections.defaultdict(int) for lane in LANE_NAMES}
+
 phase_lock         = threading.Lock()
 current_phase_idx  = 0
-phase_state        = "GREEN" # State space: GREEN, YELLOW, ALL_RED
+phase_state        = "GREEN"
 green_start_time   = time.time()
 yellow_start_time  = 0.0
 all_red_start_time = 0.0
@@ -243,7 +243,7 @@ class BackgroundVideoReader(threading.Thread):
                 time.sleep(sleep_t)
 
 # =============================================================
-# 5. AI INFERENCE CORE (Isolated Model Handles for Tracking)
+# 5. AI INFERENCE CORE (With Track Retention Mapping Registers)
 # =============================================================
 class BackgroundAIProcessor(threading.Thread):
     def __init__(self, model_path, device):
@@ -254,12 +254,15 @@ class BackgroundAIProcessor(threading.Thread):
         self.running = True
         self.half    = device != "cpu"
         
+        # Unique Track ID storage buckets per lane
+        self.tracked_vehicle_ids = {lane: set() for lane in LANE_NAMES}
+        
         if device != "cpu":
             for lane in LANE_NAMES:
                 self.models[lane].to(device)
             print(f"[STAP] ✅ 4 Isolated Tracker Streams initialized on GPU (device={device})")
         else:
-            print("[STAP] ⚠️  YOLO models on CPU")
+            print("[STAP] ⚠️ YOLO models on CPU")
 
     def run(self):
         global cached_boxes, vehicle_counts, lane_statuses
@@ -278,6 +281,7 @@ class BackgroundAIProcessor(threading.Thread):
                     continue
 
                 try:
+                    # Leverage ByteTrack inside the framework pass
                     r = self.models[lane].track(
                         img, 
                         persist=True, 
@@ -302,6 +306,7 @@ class BackgroundAIProcessor(threading.Thread):
                     conf   = float(box.conf[0])
                     bx1, by1, bx2, by2 = map(int, box.xyxy[0])
                     
+                    # Target center of boundary box
                     cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
                     
                     is_inside = cv2.pointPolygonTest(polygon, (float(cx), float(cy)), False) >= 0
@@ -318,6 +323,18 @@ class BackgroundAIProcessor(threading.Thread):
                             temp_statuses[lane] = "VEHICLE"
                         
                         temp_counts[lane] += 1
+                        
+                        # Process Class Analytics Tallying if a unique Tracking ID is present
+                        if box.id is not None:
+                            track_id = int(box.id[0])
+                            unique_key = f"{cls_id}_{track_id}"
+                            
+                            if unique_key not in self.tracked_vehicle_ids[lane]:
+                                self.tracked_vehicle_ids[lane].add(unique_key)
+                                class_name = self.labels.get(cls_id, f"Class_{cls_id}")
+                                with analytics_lock:
+                                    global_analytics_registry[lane][class_name] += 1
+
                         temp_boxes[lane].append({
                             "coords": (bx1, by1, bx2, by2),
                             "label" : f"{self.labels.get(cls_id, 'Vehicle')} {conf:.2f}",
@@ -402,38 +419,27 @@ def classify_los(count: int) -> str:
     return "F"
 
 def compute_green_time(lane: str, rain: bool) -> int:
-    """
-    Optimized Backend Adaptive Green Time Engine (Middle Ground Logic).
-    Ensures safe minimum flow boundaries while preventing starvation bounds.
-    """
     with result_lock: 
         current_queue = vehicle_counts[lane]
-        # Evaluate global pressure across all competing approaches (Fix 2 threshold check)
         total_intersection_backpressure = sum(vehicle_counts[l] for l in LANE_NAMES if l != lane)
     
-    # Philippine Setting Micro-Phasing Optimization Layer (Protects rhythm + countdowns)
     if current_queue <= 2:
-        # Assign a tightened micro-minimum (7-10s) to clear out the minor approach quickly
         rain_mod = 1.20 if rain else 1.0
         return max(7, min(10, int(7 * rain_mod)))
         
     los   = classify_los(current_queue)
     delta = max(-MAX_ADJUSTMENT, min(MAX_ADJUSTMENT, LOS_DELTA[los]))
     
-    # If backpressure across other lanes is building up (>20), damp greedy extensions
     if total_intersection_backpressure >= CONGESTION_CEILING and delta > 0:
-        delta = int(delta * 0.5) # Cut active extension down by 50% to prevent starvation delays
+        delta = int(delta * 0.5)
         
     green = BASE_GREEN[lane] + delta
-    
-    # Conditional Weather Friction Addition (Fix 3 - Only targets heavy congestion levels)
     if rain and los in ["D", "E", "F"]:
-        green += 5 # Slow discharge clearance window extension
+        green += 5
         
     return max(MIN_GREEN[lane], min(MAX_GREEN[lane], green))
 
 def compute_red_time(lane: str, greens: dict) -> int:
-    # Account for yellow + international standard all-red clearance values cumulative tracking
     return sum(greens[l] + YELLOW_TIME + ALL_RED_TIME for l in PHASE_ORDER if l != lane)
 
 def emergency_lane():
@@ -454,6 +460,7 @@ def post_to_hub():
                 "Authorization": f"Bearer {NODE_API_KEY}",
                 "Content-Type":  "application/json",
                 "Accept":        "application/json",
+                "Dark-Mode":     "0"
             }
 
             for lane in LANE_NAMES:
@@ -534,14 +541,12 @@ def add_cors(response):
 @app.route('/control/mode', methods=['POST', 'OPTIONS'])
 def control_mode():
     if request.method == 'OPTIONS': return jsonify({}), 200
-
     global manual_override, current_phase_idx, phase_state, green_start_time, committed_green
-
     data = request.get_json(force=True)
     mode = data.get('mode', '').lower()
 
     if mode not in ['auto', 'manual', 'hazard']:
-        return jsonify({'success': False, 'message': 'Invalid mode. Use auto, manual, or hazard.'}), 400
+        return jsonify({'success': False, 'message': 'Invalid field mode.'}), 400
 
     if mode == 'auto':
         manual_override = False
@@ -549,31 +554,26 @@ def control_mode():
         with phase_lock: lane = PHASE_ORDER[current_phase_idx]
         green = compute_green_time(lane, rain_detected)
         start_green(lane, green)
-
     elif mode == 'manual':
         manual_override = True
         send_to_esp32('MODE:MANUAL')
-
     elif mode == 'hazard':
         manual_override = True
         send_to_esp32('MODE:HAZARD')
-        for lane in LANE_NAMES:
-            send_to_esp32(f'HAZARD:{lane}')
+        for lane in LANE_NAMES: send_to_esp32(f'HAZARD:{lane}')
 
     return jsonify({'success': True, 'mode': mode})
 
 @app.route('/control/light', methods=['POST', 'OPTIONS'])
 def control_light():
     if request.method == 'OPTIONS': return jsonify({}), 200
-    if not manual_override:
-        return jsonify({'success': False, 'message': 'Node must be in manual or hazard mode first.'}), 422
-
+    if not manual_override: return jsonify({'success': False, 'message': 'Requires Manual Override mode first.'}), 422
     data  = request.get_json(force=True)
     lane  = data.get('lane', '').upper()
     state = data.get('state', '').lower()
 
     if lane not in LANE_NAMES or state not in ['red', 'yellow', 'green']:
-        return jsonify({'success': False, 'message': 'Invalid parameters parameter fields.'}), 400
+        return jsonify({'success': False, 'message': 'Invalid tracking criteria.'}), 400
 
     send_to_esp32(f'MANUAL_LIGHT:{lane},{state.upper()}')
     return jsonify({'success': True, 'lane': lane, 'state': state})
@@ -581,18 +581,15 @@ def control_light():
 @app.route('/control/emergency', methods=['POST', 'OPTIONS'])
 def control_emergency():
     if request.method == 'OPTIONS': return jsonify({}), 200
-
     data = request.get_json(force=True)
     lane = data.get('lane', '').upper()
 
-    if lane not in LANE_NAMES:
-        return jsonify({'success': False, 'message': f'Invalid lane. Use: {LANE_NAMES}'}), 400
+    if lane not in LANE_NAMES: return jsonify({'success': False, 'message': 'Invalid approach.'}), 400
 
     start_yellow(PHASE_ORDER[current_phase_idx])
     time.sleep(0.1)
     start_green(lane, compute_green_time(lane, rain_detected))
     send_to_esp32(f'EMERGENCY_OVERRIDE:{lane}')
-
     return jsonify({'success': True, 'emergency_lane': lane})
 
 @app.route('/status', methods=['GET'])
@@ -600,7 +597,6 @@ def get_status():
     with result_lock:
         counts   = vehicle_counts.copy()
         statuses = lane_statuses.copy()
-
     with phase_lock:
         active_lane   = PHASE_ORDER[current_phase_idx]
         current_state = phase_state
@@ -608,34 +604,24 @@ def get_status():
 
     now = time.time()
     if current_state == 'GREEN':
-        elapsed   = now - green_start_time
-        remaining = max(0, green_dur - int(elapsed))
+        remaining = max(0, green_dur - int(now - green_start_time))
     elif current_state == 'YELLOW':
-        elapsed   = now - yellow_start_time if yellow_start_time > 0 else 0
-        remaining = max(0, YELLOW_TIME - int(elapsed))
+        remaining = max(0, YELLOW_TIME - int(now - yellow_start_time if yellow_start_time > 0 else 0))
     else:
-        elapsed   = now - all_red_start_time if all_red_start_time > 0 else 0
-        remaining = max(0, ALL_RED_TIME - int(elapsed))
+        remaining = max(0, ALL_RED_TIME - int(now - all_red_start_time if all_red_start_time > 0 else 0))
 
     los_per_lane = {lane: classify_los(counts[lane]) for lane in LANE_NAMES}
-
     return jsonify({
-        'active_lane':    active_lane,
-        'phase_state':    current_state,
-        'remaining_secs': remaining,
-        'green_duration': green_dur,
-        'mode':           'manual' if manual_override else 'auto',
-        'rain':           rain_detected,
-        'vehicle_counts': counts,
-        'los':            los_per_lane,
-        'lane_statuses':  statuses,
+        'active_lane': active_lane, 'phase_state': current_state, 'remaining_secs': remaining,
+        'green_duration': green_dur, 'mode': 'manual' if manual_override else 'auto', 'rain': rain_detected,
+        'vehicle_counts': counts, 'los': los_per_lane, 'lane_statuses': statuses,
     })
 
 def run_flask_server():
     app.run(host='0.0.0.0', port=5000, threaded=True, use_reloader=False)
 
 # =============================================================
-# 9. TIMING PHASE SYSTEM TRANSITIONS (State Machine Engine)
+# 9. TIMING PHASE SYSTEM TRANSITIONS
 # =============================================================
 def start_yellow(lane: str):
     global phase_state, yellow_start_time
@@ -650,7 +636,6 @@ def start_all_red():
     with phase_lock:
         phase_state        = "ALL_RED"
         all_red_start_time = time.time()
-    # Issue absolute clearance state broadcast command over to serial line channels
     send_to_esp32("PHASE:ALL_RED,DURATION:2")
     send_to_esp32("DISPLAY:OFF")
     print("[STAP] 🚨 All-Red clearance safety interval initialized intersection-wide.")
@@ -689,121 +674,201 @@ def keepalive_thread():
             hub_tick = 0
             post_to_hub()
 
-# Launch Core Keepalives & Flask Broadcast Channels
 threading.Thread(target=keepalive_thread, daemon=True).start()
 threading.Thread(target=hub_heartbeat_thread, daemon=True).start()
 threading.Thread(target=run_flask_server, daemon=True).start() 
 print("[STAP] ✅ Per-lane casting nodes are active on Local LAN Port 5000")
 
-_first_lane  = PHASE_ORDER[0]
+_first_lane = PHASE_ORDER[0]
 _first_green = compute_green_time(_first_lane, rain_detected)
 start_green(_first_lane, _first_green)
 
 cv2.namedWindow("STAP Local Engine Monitor", cv2.WINDOW_NORMAL)
 
+# Create Output Recording Stream Object Configuration mapping 2x2 grid scale
+GRID_WIDTH  = CAM_WIDTH * 2
+GRID_HEIGHT = CAM_HEIGHT * 2
+RECORDING_PATH = os.path.join(CURRENT_RUN_DIR, "session_recording.mp4")
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+video_writer = cv2.VideoWriter(RECORDING_PATH, fourcc, float(TARGET_FPS), (GRID_WIDTH, GRID_HEIGHT))
+print(f"[STAP] 🎥 Video Logging Pipeline Engaged -> {RECORDING_PATH}")
+
 # =============================================================
 # 10. MAIN PROCESS AND COMPOSITION LOOP (30 FPS)
 # =============================================================
-while True:
-    t_loop = time.time()
-    read_serial_incoming()
-    is_offline = (ser is None) or (t_loop - last_comm_time > DATA_TIMEOUT)
+try:
+    while True:
+        t_loop = time.time()
+        read_serial_incoming()
+        is_offline = (ser is None) or (t_loop - last_comm_time > DATA_TIMEOUT)
 
-    with frame_lock:
-        imgs = [f.copy() if f is not None else None for f in latest_frames]
+        with frame_lock:
+            imgs = [f.copy() if f is not None else None for f in latest_frames]
 
-    with result_lock:
-        local_boxes    = {k: list(v) for k, v in cached_boxes.items()}
-        local_counts   = vehicle_counts.copy()
-        local_statuses = lane_statuses.copy()
+        with result_lock:
+            local_boxes    = {k: list(v) for k, v in cached_boxes.items()}
+            local_counts   = vehicle_counts.copy()
+            local_statuses = lane_statuses.copy()
 
-    with phase_lock:
-        snap_lane    = PHASE_ORDER[current_phase_idx]
-        snap_state   = phase_state
-        snap_green   = committed_green
-        snap_g_start = green_start_time
-        snap_y_start = yellow_start_time
-        snap_ar_start= all_red_start_time
+        with phase_lock:
+            snap_lane    = PHASE_ORDER[current_phase_idx]
+            snap_state   = phase_state
+            snap_green   = committed_green
+            snap_g_start = green_start_time
+            snap_y_start = yellow_start_time
+            snap_ar_start= all_red_start_time
 
-    if any(f is None for f in imgs):
-        time.sleep(0.01); continue
+        if any(f is None for f in imgs):
+            time.sleep(0.01); continue
 
-    now = time.time()
-    if snap_state == "GREEN":
-        green_elapsed  = now - snap_g_start
-        green_remain   = max(0, snap_green - int(green_elapsed))
-        disp_remain    = green_remain
-    elif snap_state == "YELLOW":
-        yellow_elapsed = now - snap_y_start if snap_y_start > 0 else 0.0
-        disp_remain    = max(0, YELLOW_TIME - int(yellow_elapsed))
-    else:
-        all_red_elapsed= now - snap_ar_start if snap_ar_start > 0 else 0.0
-        disp_remain    = max(0, ALL_RED_TIME - int(all_red_elapsed))
-
-    display_greens = {lane: compute_green_time(lane, rain_detected) for lane in LANE_NAMES}
-    display_greens[snap_lane] = snap_green
-
-    drawn = list(imgs)
-    for idx, lane in enumerate(LANE_NAMES):
-        fr = drawn[idx]
-        
-        # Enforce drawing the corrected, scaled down polygon onto the 640x480 preview window matrix
-        cv2.polylines(fr, [ROI_POLYGONS[lane]], isClosed=True, color=(255,165,0), thickness=2)
-
-        for b in local_boxes[lane]:
-            fx1, fy1, fx2, fy2 = b["coords"]
-            cv2.rectangle(fr, (fx1, fy1), (fx2, fy2), b["color"], 2)
-            cv2.putText(fr, b["label"], (fx1, max(fy1-7, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, b["color"], 1)
-
-        los  = classify_los(local_counts[lane])
-        base = BASE_GREEN[lane]
-        adj  = display_greens[lane]
-        red  = compute_red_time(lane, display_greens)
-        cv2.putText(fr, f"LOS:{los} V:{local_counts[lane]} G:{adj}s(b:{base}s) R:{red}s",
-                    (8, CAM_HEIGHT-12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255,255,255), 1)
-
-        is_emg_confirmed = local_statuses[lane] == "EMERGENCY"
-        is_emg_charging  = emg_buffer.is_charging(lane)
-
-        if is_emg_confirmed: sc = (0, 0, 255); status_text = f"{lane}: EMERGENCY"
-        elif is_emg_charging:
-            sc = (0, 165, 255); streak = emg_buffer.streak_elapsed(lane)
-            status_text = f"{lane}: EMG? [{streak:.1f}/{EMERGENCY_SUSTAIN_SECONDS}s]"
-        elif lane == snap_lane:
-            sc = (0, 255, 0) if snap_state == "GREEN" else ((0, 255, 255) if snap_state == "YELLOW" else (0, 0, 255))
-            status_text = f"{lane}: [{snap_state}]"
-        else:
-            sc = (140, 140, 140); status_text = f"{lane}: {local_statuses[lane]}"
-
-        cv2.putText(fr, status_text, (8, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, sc, 2)
-
-    grid = np.vstack((np.hstack((drawn[0], drawn[1])), np.hstack((drawn[2], drawn[3]))))
-    hud_color  = (0, 255, 255)
-    mode_label = "OFFLINE/FALLBACK" if is_offline else ("MANUAL OVERRIDE" if manual_override else "AUTO (SMART AI)")
-    if any(v == "EMERGENCY" for v in local_statuses.values()):
-        mode_label = "!!! EMERGENCY PREEMPTION ACTIVE !!!"; hud_color = (0, 0, 255)
-    elif rain_detected: mode_label += " + CONDITIONAL RAIN BUFFERS"
-
-    cv2.putText(grid, f"SYSTEM MODE: {mode_label}", (15, grid.shape[0]-50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
-    cv2.putText(grid, f"ACTIVE PHASE: {snap_lane} [{snap_state}] | State Clock Remaining: {disp_remain}s | Target Ceiling Green: {snap_green}s",
-                (15, grid.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.62, hud_color, 2)
-
-    cv2.imshow("STAP Local Engine Monitor", grid)
-
-    for idx, lane in enumerate(LANE_NAMES):
-        with lane_stream_locks[lane]:
-            global_lane_frames[lane] = drawn[idx].copy()
-
-    # Hardware Automation Logic Execution Block (State Transitions Cascade Chain)
-    if not manual_override:
+        now = time.time()
         if snap_state == "GREEN":
-            emg = emergency_lane()
-            if emg and emg != snap_lane: start_yellow(snap_lane)
-            elif green_elapsed >= snap_green: start_yellow(snap_lane)
+            disp_remain = max(0, snap_green - int(now - snap_g_start))
         elif snap_state == "YELLOW":
-            if now - snap_y_start >= YELLOW_TIME: start_all_red()
-        elif snap_state == "ALL_RED":
-            if now - snap_ar_start >= ALL_RED_TIME: advance_phase()
+            disp_remain = max(0, YELLOW_TIME - int(now - snap_y_start if snap_y_start > 0 else 0.0))
+        else:
+            disp_remain = max(0, ALL_RED_TIME - int(now - snap_ar_start if snap_ar_start > 0 else 0.0))
 
-    cv2.waitKey(1)
-    time.sleep(max(0.001, (1.0/TARGET_FPS) - (time.time() - t_loop)))
+        display_greens = {lane: compute_green_time(lane, rain_detected) for lane in LANE_NAMES}
+        display_greens[snap_lane] = snap_green
+
+        drawn = list(imgs)
+        for idx, lane in enumerate(LANE_NAMES):
+            fr = drawn[idx]
+            cv2.polylines(fr, [ROI_POLYGONS[lane]], isClosed=True, color=(255,165,0), thickness=2)
+
+            for b in local_boxes[lane]:
+                fx1, fy1, fx2, fy2 = b["coords"]
+                cv2.rectangle(fr, (fx1, fy1), (fx2, fy2), b["color"], 2)
+                cv2.putText(fr, b["label"], (fx1, max(fy1-7, 15)), cv2.FONT_HERSHEY_SIMPLEX, 0.45, b["color"], 1)
+
+            los  = classify_los(local_counts[lane])
+            base = BASE_GREEN[lane]
+            adj  = display_greens[lane]
+            red  = compute_red_time(lane, display_greens)
+            
+            # Fetch cumulative custom track counters to map into HUD layer
+            with analytics_lock:
+                lane_lifetime_total = sum(global_analytics_registry[lane].values())
+
+            cv2.putText(fr, f"LOS:{los} LIVE:{local_counts[lane]} CUMULATIVE:{lane_lifetime_total}",
+                        (8, CAM_HEIGHT-28), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255,255,255), 1)
+            cv2.putText(fr, f"G:{adj}s(b:{base}s) R:{red}s",
+                        (8, CAM_HEIGHT-12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200,255,200), 1)
+
+            is_emg_confirmed = local_statuses[lane] == "EMERGENCY"
+            is_emg_charging  = emg_buffer.is_charging(lane)
+
+            if is_emg_confirmed: sc = (0, 0, 255); status_text = f"{lane}: EMERGENCY"
+            elif is_emg_charging:
+                sc = (0, 165, 255); streak = emg_buffer.streak_elapsed(lane)
+                status_text = f"{lane}: EMG? [{streak:.1f}/{EMERGENCY_SUSTAIN_SECONDS}s]"
+            elif lane == snap_lane:
+                sc = (0, 255, 0) if snap_state == "GREEN" else ((0, 255, 255) if snap_state == "YELLOW" else (0, 0, 255))
+                status_text = f"{lane}: [{snap_state}]"
+            else:
+                sc = (140, 140, 140); status_text = f"{lane}: {local_statuses[lane]}"
+
+            cv2.putText(fr, status_text, (8, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, sc, 2)
+
+        grid = np.vstack((np.hstack((drawn[0], drawn[1])), np.hstack((drawn[2], drawn[3]))))
+        hud_color  = (0, 255, 255)
+        mode_label = "OFFLINE/FALLBACK" if is_offline else ("MANUAL OVERRIDE" if manual_override else "AUTO (SMART AI)")
+        if any(v == "EMERGENCY" for v in local_statuses.values()):
+            mode_label = "!!! EMERGENCY PREEMPTION ACTIVE !!!"; hud_color = (0, 0, 255)
+        elif rain_detected: mode_label += " + CONDITIONAL RAIN BUFFERS"
+
+        cv2.putText(grid, f"SYSTEM MODE: {mode_label}", (15, grid.shape[0]-50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
+        cv2.putText(grid, f"ACTIVE PHASE: {snap_lane} [{snap_state}] | State Clock Remaining: {disp_remain}s | Target Ceiling Green: {snap_green}s",
+                    (15, grid.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.62, hud_color, 2)
+
+        # Write the compiled grid matrix canvas directly to storage
+        video_writer.write(grid)
+
+        cv2.imshow("STAP Local Engine Monitor", grid)
+
+        for idx, lane in enumerate(LANE_NAMES):
+            with lane_stream_locks[lane]:
+                global_lane_frames[lane] = drawn[idx].copy()
+
+        if not manual_override:
+            if snap_state == "GREEN":
+                emg = emergency_lane()
+                if emg and emg != snap_lane: start_yellow(snap_lane)
+                elif now - snap_g_start >= snap_green: start_yellow(snap_lane)
+            elif snap_state == "YELLOW":
+                if now - snap_y_start >= YELLOW_TIME: start_all_red()
+            elif snap_state == "ALL_RED":
+                if now - snap_ar_start >= ALL_RED_TIME: advance_phase()
+
+        # Intercept window signal rules or standard terminal keys
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q') or cv2.getWindowProperty("STAP Local Engine Monitor", cv2.WND_PROP_VISIBLE) < 1:
+            break
+        
+        time.sleep(max(0.001, (1.0/TARGET_FPS) - (time.time() - t_loop)))
+
+finally:
+    # =============================================================
+    # 11. CLEANUP EXITS & DATA ANALYTICS SHEET GENERATION
+    # =============================================================
+    print("\n[STAP] 🛑 Shutdown Signal Intercepted. Closing background modules cleanly...")
+    
+    # Halt streaming reader matrices
+    for r in readers: r.running = False
+    ai_core.running = False
+    video_writer.release()
+    cv2.destroyAllWindows()
+    
+    CSV_PATH = os.path.join(CURRENT_RUN_DIR, "traffic_summary.csv")
+    print(f"[STAP] 📊 Compiling vehicle metrics data sheets -> {CSV_PATH}")
+    
+    with analytics_lock:
+        # Extract all uniquely registered names found across lanes
+        all_detected_classes = set()
+        for lane in LANE_NAMES:
+            for cls_name in global_analytics_registry[lane].keys():
+                all_detected_classes.add(cls_name)
+        
+        sorted_classes = sorted(list(all_detected_classes))
+        
+        try:
+            with open(CSV_PATH, mode='w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                
+                # Format Document Headers
+                writer.writerow(["Traffic Metric Summary Report"])
+                writer.writerow(["Timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
+                writer.writerow([])
+                
+                header_row = ["Approach Lane"] + sorted_classes + ["Total Unique Count"]
+                writer.writerow(header_row)
+                
+                # Write Metrics Per Lane Approach
+                class_grand_totals = collections.defaultdict(int)
+                intersection_grand_total = 0
+                
+                for lane in LANE_NAMES:
+                    row = [lane]
+                    lane_sum = 0
+                    for cls_name in sorted_classes:
+                        val = global_analytics_registry[lane].get(cls_name, 0)
+                        row.append(val)
+                        lane_sum += val
+                        class_grand_totals[cls_name] += val
+                    row.append(lane_sum)
+                    intersection_grand_total += lane_sum
+                    writer.writerow(row)
+                
+                # Append Grand Totals Row
+                totals_row = ["TOTAL INTERSECTION"]
+                for cls_name in sorted_classes:
+                    totals_row.append(class_grand_totals[cls_name])
+                totals_row.append(intersection_grand_total)
+                writer.writerow(totals_row)
+                
+            print(f"[STAP] ✅ Data Export successful. Total unique intersection-wide vehicles logged: {intersection_grand_total}")
+        except Exception as csv_err:
+            print(f"[STAP] ❌ Failed to write CSV file: {csv_err}")
+            
+    print(f"[STAP] Run complete. Check folder path '{CURRENT_RUN_DIR}' for all generated session files.")
