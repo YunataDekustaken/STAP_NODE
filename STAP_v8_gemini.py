@@ -1,8 +1,8 @@
 """
 STAP: Smart Traffic Automation Program
 =======================================
-v13.0 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
-        with Class-Specific Tracking Data Export & Session Video Logging.
+v14.0 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
+        with Lane-Specific Transparent ROI Alpha-Blended HUD Overlays.
 """
 
 from ultralytics import YOLO
@@ -20,7 +20,7 @@ from datetime import datetime
 from flask import Flask, Response, request, jsonify
 
 # =============================================================
-# 0. AUTO-INCREMENTING RUN DIRECTORY & VIDEO WRITER SETUP
+# 0. AUTO-INCREMENTING RUN DIRECTORY SETUP
 # =============================================================
 BASE_RUNS_DIR = "runs"
 os.makedirs(BASE_RUNS_DIR, exist_ok=True)
@@ -48,6 +48,15 @@ VEHICLE_CLASS_IDS   = [1, 2, 3, 4, 6, 7, 8, 10, 11, 12, 13]
 
 LANE_NAMES  = ["NORTH", "SOUTH", "EAST", "WEST"]
 PHASE_ORDER = ["NORTH", "SOUTH", "EAST", "WEST"]
+
+# --- ADVANCED HUD LANE-SPECIFIC INTERSECTION COLOR REGISTERS (BGR Format) ---
+ROI_COLORS = {
+    "NORTH": (255, 255, 0),    # Cyan
+    "SOUTH": (0, 255, 0),      # Bright Green
+    "EAST": (0, 255, 255),     # Yellow
+    "WEST": (255, 0, 255)      # Magenta
+}
+ROI_ALPHA = 0.15 # 15% opacity transparency factor level for the overlay polygon mask fill
 
 VIDEO_FILES = [
     r"C:\Users\Raphael\Desktop\YOLO\FINAL\13_North.MOV",
@@ -152,9 +161,9 @@ cached_boxes   = {lane: [] for lane in LANE_NAMES}
 vehicle_counts = {lane: 0  for lane in LANE_NAMES}
 lane_statuses  = {lane: "CLEAR" for lane in LANE_NAMES}
 
-# Lifetime Unique Object Analytics Tracker Engine
 analytics_lock = threading.Lock()
 global_analytics_registry = {lane: collections.defaultdict(int) for lane in LANE_NAMES}
+known_classes_seen = set() 
 
 phase_lock         = threading.Lock()
 current_phase_idx  = 0
@@ -243,7 +252,7 @@ class BackgroundVideoReader(threading.Thread):
                 time.sleep(sleep_t)
 
 # =============================================================
-# 5. AI INFERENCE CORE (With Track Retention Mapping Registers)
+# 5. AI INFERENCE CORE
 # =============================================================
 class BackgroundAIProcessor(threading.Thread):
     def __init__(self, model_path, device):
@@ -254,7 +263,6 @@ class BackgroundAIProcessor(threading.Thread):
         self.running = True
         self.half    = device != "cpu"
         
-        # Unique Track ID storage buckets per lane
         self.tracked_vehicle_ids = {lane: set() for lane in LANE_NAMES}
         
         if device != "cpu":
@@ -265,7 +273,7 @@ class BackgroundAIProcessor(threading.Thread):
             print("[STAP] ⚠️ YOLO models on CPU")
 
     def run(self):
-        global cached_boxes, vehicle_counts, lane_statuses
+        global cached_boxes, vehicle_counts, lane_statuses, known_classes_seen
         while self.running:
             temp_counts = {l: 0 for l in LANE_NAMES}
             temp_statuses = {l: "CLEAR" for l in LANE_NAMES}
@@ -281,7 +289,6 @@ class BackgroundAIProcessor(threading.Thread):
                     continue
 
                 try:
-                    # Leverage ByteTrack inside the framework pass
                     r = self.models[lane].track(
                         img, 
                         persist=True, 
@@ -305,8 +312,6 @@ class BackgroundAIProcessor(threading.Thread):
                     cls_id = int(box.cls[0])
                     conf   = float(box.conf[0])
                     bx1, by1, bx2, by2 = map(int, box.xyxy[0])
-                    
-                    # Target center of boundary box
                     cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
                     
                     is_inside = cv2.pointPolygonTest(polygon, (float(cx), float(cy)), False) >= 0
@@ -324,7 +329,6 @@ class BackgroundAIProcessor(threading.Thread):
                         
                         temp_counts[lane] += 1
                         
-                        # Process Class Analytics Tallying if a unique Tracking ID is present
                         if box.id is not None:
                             track_id = int(box.id[0])
                             unique_key = f"{cls_id}_{track_id}"
@@ -334,11 +338,12 @@ class BackgroundAIProcessor(threading.Thread):
                                 class_name = self.labels.get(cls_id, f"Class_{cls_id}")
                                 with analytics_lock:
                                     global_analytics_registry[lane][class_name] += 1
+                                    known_classes_seen.add(class_name)
 
                         temp_boxes[lane].append({
                             "coords": (bx1, by1, bx2, by2),
                             "label" : f"{self.labels.get(cls_id, 'Vehicle')} {conf:.2f}",
-                            "color" : (0, 0, 255) if is_emg else (0, 255, 0),
+                            "color" : (0, 0, 255) if is_emg else ROI_COLORS[lane], # Match box text to lane color registry
                         })
 
             for lane in LANE_NAMES:
@@ -460,7 +465,6 @@ def post_to_hub():
                 "Authorization": f"Bearer {NODE_API_KEY}",
                 "Content-Type":  "application/json",
                 "Accept":        "application/json",
-                "Dark-Mode":     "0"
             }
 
             for lane in LANE_NAMES:
@@ -546,7 +550,7 @@ def control_mode():
     mode = data.get('mode', '').lower()
 
     if mode not in ['auto', 'manual', 'hazard']:
-        return jsonify({'success': False, 'message': 'Invalid field mode.'}), 400
+        return jsonify({'success': False, 'message': 'Invalid mode.'}), 400
 
     if mode == 'auto':
         manual_override = False
@@ -573,7 +577,7 @@ def control_light():
     state = data.get('state', '').lower()
 
     if lane not in LANE_NAMES or state not in ['red', 'yellow', 'green']:
-        return jsonify({'success': False, 'message': 'Invalid tracking criteria.'}), 400
+        return jsonify({'success': False, 'message': 'Invalid fields.'}), 400
 
     send_to_esp32(f'MANUAL_LIGHT:{lane},{state.upper()}')
     return jsonify({'success': True, 'lane': lane, 'state': state})
@@ -683,9 +687,11 @@ _first_lane = PHASE_ORDER[0]
 _first_green = compute_green_time(_first_lane, rain_detected)
 start_green(_first_lane, _first_green)
 
+# --- INITIALIZE MULTI-WINDOW SYSTEMS ---
 cv2.namedWindow("STAP Local Engine Monitor", cv2.WINDOW_NORMAL)
+cv2.namedWindow("STAP Analytics Dashboard", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("STAP Analytics Dashboard", 550, 400)
 
-# Create Output Recording Stream Object Configuration mapping 2x2 grid scale
 GRID_WIDTH  = CAM_WIDTH * 2
 GRID_HEIGHT = CAM_HEIGHT * 2
 RECORDING_PATH = os.path.join(CURRENT_RUN_DIR, "session_recording.mp4")
@@ -735,7 +741,18 @@ try:
         drawn = list(imgs)
         for idx, lane in enumerate(LANE_NAMES):
             fr = drawn[idx]
-            cv2.polylines(fr, [ROI_POLYGONS[lane]], isClosed=True, color=(255,165,0), thickness=2)
+            lane_color = ROI_COLORS[lane]
+
+            # --- ENGINE ARCHITECTURE FOR TRANSPARENT ROI BLENDING ---
+            # Create a clone of the original frame matrix to act as the transparency draw surface
+            overlay = fr.copy()
+            # Draw a solid polygon using the specific color assigned to the lane
+            cv2.fillPoly(overlay, [ROI_POLYGONS[lane]], lane_color)
+            # Mathematically blend the solid overlay back onto the live stream frame
+            cv2.addWeighted(overlay, ROI_ALPHA, fr, 1.0 - ROI_ALPHA, 0, fr)
+
+            # Draw the clean perimeter outline edge directly on top of the alpha fill area
+            cv2.polylines(fr, [ROI_POLYGONS[lane]], isClosed=True, color=lane_color, thickness=2)
 
             for b in local_boxes[lane]:
                 fx1, fy1, fx2, fy2 = b["coords"]
@@ -747,13 +764,12 @@ try:
             adj  = display_greens[lane]
             red  = compute_red_time(lane, display_greens)
             
-            # Fetch cumulative custom track counters to map into HUD layer
             with analytics_lock:
                 lane_lifetime_total = sum(global_analytics_registry[lane].values())
 
-            cv2.putText(fr, f"LOS:{los} LIVE:{local_counts[lane]} CUMULATIVE:{lane_lifetime_total}",
+            cv2.putText(fr, f"APPROACH: {lane} | LOS: {los} | QUEUE: {local_counts[lane]}",
                         (8, CAM_HEIGHT-28), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255,255,255), 1)
-            cv2.putText(fr, f"G:{adj}s(b:{base}s) R:{red}s",
+            cv2.putText(fr, f"G:{adj}s(base:{base}s) R:{red}s | LOGGED UNIQUE:{lane_lifetime_total}",
                         (8, CAM_HEIGHT-12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200,255,200), 1)
 
             is_emg_confirmed = local_statuses[lane] == "EMERGENCY"
@@ -782,10 +798,57 @@ try:
         cv2.putText(grid, f"ACTIVE PHASE: {snap_lane} [{snap_state}] | State Clock Remaining: {disp_remain}s | Target Ceiling Green: {snap_green}s",
                     (15, grid.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.62, hud_color, 2)
 
-        # Write the compiled grid matrix canvas directly to storage
         video_writer.write(grid)
-
         cv2.imshow("STAP Local Engine Monitor", grid)
+
+        # =============================================================
+        # 10b. GENERATE DEDICATED POP-UP SCOREBOARD UI WINDOW
+        # =============================================================
+        db_w, db_h = 550, 400
+        dashboard_img = np.zeros((db_h, db_w, 3), dtype=np.uint8)
+        cv2.rectangle(dashboard_img, (0, 0), (db_w, db_h), (24, 24, 24), -1)
+        cv2.rectangle(dashboard_img, (10, 10), (db_w-10, 50), (40, 40, 40), -1)
+        cv2.putText(dashboard_img, "STAP LIVE VEHICLE ANALYTICS ENGINE", (25, 36), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 255), 2)
+
+        with analytics_lock:
+            classes_to_render = sorted(list(known_classes_seen))
+            cv2.putText(dashboard_img, f"{'CLASS':<15}{'NORTH':<8}{'SOUTH':<8}{'EAST':<8}{'WEST':<8}{'TOTAL':<6}", 
+                        (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1)
+            cv2.line(dashboard_img, (15, 95), (db_w-15, 95), (70, 70, 70), 1)
+
+            y_pos = 120
+            grand_total_all_lanes = 0
+            class_column_totals = collections.defaultdict(int)
+
+            for cls_name in classes_to_render:
+                n_v = global_analytics_registry["NORTH"].get(cls_name, 0)
+                s_v = global_analytics_registry["SOUTH"].get(cls_name, 0)
+                e_v = global_analytics_registry["EAST"].get(cls_name, 0)
+                w_v = global_analytics_registry["WEST"].get(cls_name, 0)
+                row_sum = n_v + s_v + e_v + w_v
+                
+                class_column_totals["NORTH"] += n_v
+                class_column_totals["SOUTH"] += s_v
+                class_column_totals["EAST"] += e_v
+                class_column_totals["WEST"] += w_v
+                grand_total_all_lanes += row_sum
+
+                row_text = f"{cls_name[:12]:<15}{n_v:<8}{s_v:<8}{e_v:<8}{w_v:<8}{row_sum:<6}"
+                cv2.putText(dashboard_img, row_text, (20, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1)
+                y_pos += 22
+                if y_pos > db_h - 60: break 
+
+            cv2.line(dashboard_img, (15, db_h-45), (db_w-15, db_h-45), (0, 255, 255), 1)
+            footer_text = f"{'GRAND TOTAL':<15}"\
+                          f"{class_column_totals['NORTH']:<8}"\
+                          f"{class_column_totals['SOUTH']:<8}"\
+                          f"{class_column_totals['EAST']:<8}"\
+                          f"{class_column_totals['WEST']:<8}"\
+                          f"{grand_total_all_lanes:<6}"
+            cv2.putText(dashboard_img, footer_text, (20, db_h-25), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
+
+        cv2.imshow("STAP Analytics Dashboard", dashboard_img)
 
         for idx, lane in enumerate(LANE_NAMES):
             with lane_stream_locks[lane]:
@@ -801,9 +864,10 @@ try:
             elif snap_state == "ALL_RED":
                 if now - snap_ar_start >= ALL_RED_TIME: advance_phase()
 
-        # Intercept window signal rules or standard terminal keys
         key = cv2.waitKey(1) & 0xFF
-        if key == ord('q') or cv2.getWindowProperty("STAP Local Engine Monitor", cv2.WND_PROP_VISIBLE) < 1:
+        if (key == ord('q') or 
+            cv2.getWindowProperty("STAP Local Engine Monitor", cv2.WND_PROP_VISIBLE) < 1 or
+            cv2.getWindowProperty("STAP Analytics Dashboard", cv2.WND_PROP_VISIBLE) < 1):
             break
         
         time.sleep(max(0.001, (1.0/TARGET_FPS) - (time.time() - t_loop)))
@@ -814,7 +878,6 @@ finally:
     # =============================================================
     print("\n[STAP] 🛑 Shutdown Signal Intercepted. Closing background modules cleanly...")
     
-    # Halt streaming reader matrices
     for r in readers: r.running = False
     ai_core.running = False
     video_writer.release()
@@ -824,34 +887,24 @@ finally:
     print(f"[STAP] 📊 Compiling vehicle metrics data sheets -> {CSV_PATH}")
     
     with analytics_lock:
-        # Extract all uniquely registered names found across lanes
-        all_detected_classes = set()
-        for lane in LANE_NAMES:
-            for cls_name in global_analytics_registry[lane].keys():
-                all_detected_classes.add(cls_name)
-        
-        sorted_classes = sorted(list(all_detected_classes))
-        
+        all_detected_classes = sorted(list(known_classes_seen))
         try:
             with open(CSV_PATH, mode='w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                
-                # Format Document Headers
                 writer.writerow(["Traffic Metric Summary Report"])
                 writer.writerow(["Timestamp", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
                 writer.writerow([])
                 
-                header_row = ["Approach Lane"] + sorted_classes + ["Total Unique Count"]
+                header_row = ["Approach Lane"] + all_detected_classes + ["Total Unique Count"]
                 writer.writerow(header_row)
                 
-                # Write Metrics Per Lane Approach
                 class_grand_totals = collections.defaultdict(int)
                 intersection_grand_total = 0
                 
                 for lane in LANE_NAMES:
                     row = [lane]
                     lane_sum = 0
-                    for cls_name in sorted_classes:
+                    for cls_name in all_detected_classes:
                         val = global_analytics_registry[lane].get(cls_name, 0)
                         row.append(val)
                         lane_sum += val
@@ -860,9 +913,8 @@ finally:
                     intersection_grand_total += lane_sum
                     writer.writerow(row)
                 
-                # Append Grand Totals Row
                 totals_row = ["TOTAL INTERSECTION"]
-                for cls_name in sorted_classes:
+                for cls_name in all_detected_classes:
                     totals_row.append(class_grand_totals[cls_name])
                 totals_row.append(intersection_grand_total)
                 writer.writerow(totals_row)
