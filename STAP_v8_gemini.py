@@ -54,8 +54,8 @@ CAM_HEIGHT   = 480
 TARGET_FPS   = 30
 DATA_TIMEOUT = 5.0
 
-# --- REGION OF INTEREST (ROI) CONFIGURATION & AUTO-SCALING LAYER ---
-# 1. Copy-paste future high-resolution raw ROI coordinates right here:
+# --- AUTOMATED REGION OF INTEREST (ROI) ENGINE ---
+# Your raw high-resolution custom coordinates:
 RAW_HIGH_RES_ROIS = {
     "WEST": np.array([[683, 1534], [1853, 427], [2526, 424], [2748, 1605]], dtype=np.int32),
     
@@ -68,19 +68,28 @@ RAW_HIGH_RES_ROIS = {
     "SOUTH": np.array([[579, 897], [601, 528], [869, 318], [1250, 310], [1361, 927]], dtype=np.int32)
 }
 
-# 2. Define the source video resolution canvas where your coordinates were captured.
-# For standard phone-shot videos or HD cameras, this is typically 1920x1080, 2.7K, or 4K.
-# Adjust these values if your source metadata changes.
-ORIGINAL_SOURCE_WIDTH  = 2800
-ORIGINAL_SOURCE_HEIGHT = 2200
-
-# 3. Automatic Geometry Transform Block: Maps high-res values safely into 640x480 space
 ROI_POLYGONS = {}
-for lane, polygon_points in RAW_HIGH_RES_ROIS.items():
-    scaled_points = polygon_points.copy().astype(np.float32)
-    scaled_points[:, 0] = (scaled_points[:, 0] / ORIGINAL_SOURCE_WIDTH) * CAM_WIDTH
-    scaled_points[:, 1] = (scaled_points[:, 1] / ORIGINAL_SOURCE_HEIGHT) * CAM_HEIGHT
-    ROI_POLYGONS[lane] = scaled_points.astype(np.int32)
+print("[STAP] Calibrating matching ROI geometry scales automatically...")
+
+for idx, lane in enumerate(LANE_NAMES):
+    # Dynamically read the true width and height of each video file to avoid skewing
+    test_cap = cv2.VideoCapture(VIDEO_FILES[idx])
+    src_w = test_cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    src_h = test_cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    test_cap.release()
+    
+    # Check if video opened successfully, otherwise fallback to standard 1080p
+    if src_w <= 0 or src_h <= 0:
+        src_w, src_h = 1920.0, 1080.0
+        print(f"[STAP] ⚠️ Unable to read video dimensions for {lane}. Using fallback 1920x1080.")
+    else:
+        print(f"[STAP] Direct mapping calibrated for {lane}: Source ({int(src_w)}x{int(src_h)}) -> Process Target ({CAM_WIDTH}x{CAM_HEIGHT})")
+
+    # Run calculation to perfectly map original dimensions into 640x480 container footprint
+    poly_points = RAW_HIGH_RES_ROIS[lane].copy().astype(np.float32)
+    poly_points[:, 0] = (poly_points[:, 0] / src_w) * CAM_WIDTH
+    poly_points[:, 1] = (poly_points[:, 1] / src_h) * CAM_HEIGHT
+    ROI_POLYGONS[lane] = poly_points.astype(np.int32)
 # --------------------------------------------------------------------
 
 # Engineered base green times (from traffic study)
