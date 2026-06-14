@@ -370,7 +370,7 @@ void parsePythonCommand(String msg) {
 }
 
 // =============================================================
-# 10. AUTO ONLINE MODE
+// 10. AUTO ONLINE MODE
 // =============================================================
 void runAutoOnline(unsigned long ms, bool forceUpdate) {
   if (onlineSignal == SIG_GREEN) {
