@@ -1,8 +1,9 @@
 """
 STAP: Smart Traffic Automation Program
 =======================================
-v18.1 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
-        with Extended Watchdog Timers and Optimized State Sync Engines.
+v18.5 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
+        with Dedicated Asynchronous Watchdog Thread Timer Decoupled Natively 
+        from Main Loop Process Latencies to Eliminate All System Flickering.
 """
 
 from ultralytics import YOLO
@@ -65,6 +66,11 @@ ROI_COLORS = {
 }
 ROI_ALPHA = 0.15 
 
+# --- CRITICAL FIX: EXPLICIT INITIAL HARDWARE & ENVIRONMENT GLOBAL INITIALIZATIONS ---
+rain_detected   = False
+manual_override = False
+last_comm_time  = time.time()
+
 VIDEO_FILES = [
     r"C:\Users\Raphael\Desktop\YOLO\FINAL\13_North.MOV",
     r"C:\Users\Raphael\Desktop\YOLO\FINAL\13_South.mp4",
@@ -76,7 +82,7 @@ LOOP_VIDEOS  = True
 CAM_WIDTH    = 640
 CAM_HEIGHT   = 480
 TARGET_FPS   = 30
-DATA_TIMEOUT = 6.0  # Synced to match the 6000ms hardware watchdog window exactly
+DATA_TIMEOUT = 6.0  # Synced to match the 6000ms hardware watchdog window
 
 # --- AUTOMATED REGION OF INTEREST (ROI) ENGINE ---
 RAW_HIGH_RES_ROIS = {
@@ -163,6 +169,7 @@ else:
 # =============================================================
 frame_lock  = threading.Lock()
 result_lock = threading.Lock()
+serial_lock = threading.Lock() 
 
 lane_stream_locks = {lane: threading.Lock() for lane in LANE_NAMES}
 global_lane_frames = {lane: None for lane in LANE_NAMES}
@@ -399,11 +406,6 @@ try:
     ser.reset_output_buffer()
     print(f"[STAP] ✅ Connected to ESP32 on {SERIAL_PORT}")
     time.sleep(1)
-    print("[STAP] Sending boot keepalives while YOLO loads...")
-    for _ in range(15):
-        ser.write(b"PING:NORTH\n")
-        ser.flush()
-        time.sleep(0.3)
 except Exception as e:
     print(f"[STAP] ❌ Serial connection failed ({e}). Running in Offline-simulation mode.")
     ser = None
@@ -421,37 +423,34 @@ time.sleep(2.0)
 def send_to_esp32(msg: str):
     if ser and ser.is_open:
         try:
-            ser.write(f"{msg}\n".encode("utf-8"))
-            ser.flush()
+            with serial_lock: 
+                ser.write(f"{msg}\n".encode("utf-8"))
         except Exception: pass
-
-rain_detected   = False
-manual_override = False
-last_comm_time  = time.time()
 
 def read_serial_incoming():
     global rain_detected, manual_override, last_comm_time
-    if ser and ser.in_waiting:
+    if ser:
         try:
-            line = ser.readline().decode("utf-8", errors="ignore").strip()
-            if not line: return
-            
-            last_comm_time = time.time()
-            
-            if "RAIN:" in line and "MODE:" in line:
-                for part in line.split(","):
-                    if part.startswith("RAIN:"):
-                        rain_detected = (part.split(":")[1] == "1")
-                    elif part.startswith("MODE:"):
-                        manual_override = (part.split(":")[1] == "MANUAL")
-            
-            elif line.startswith("STATE:"):
-                payload = line.replace("STATE:", "")
-                lane, hardware_lamp = payload.split(",")
-                if lane in LANE_NAMES and hardware_lamp in ["RED", "YELLOW", "GREEN"]:
-                    with result_lock:
-                        manual_lane_lights[lane] = hardware_lamp
-                        
+            while ser.in_waiting > 0:
+                line = ser.readline().decode("utf-8", errors="ignore").strip()
+                if not line: continue
+                
+                last_comm_time = time.time()
+                
+                if "RAIN:" in line and "MODE:" in line:
+                    for part in line.split(","):
+                        if part.startswith("RAIN:"):
+                            rain_detected = (part.split(":")[1] == "1")
+                        elif part.startswith("MODE:"):
+                            manual_override = (part.split(":")[1] == "MANUAL")
+                
+                elif line.startswith("STATE:"):
+                    payload = line.replace("STATE:", "")
+                    lane, hardware_lamp = payload.split(",")
+                    if lane in LANE_NAMES and hardware_lamp in ["RED", "YELLOW", "GREEN"]:
+                        with result_lock:
+                            manual_lane_lights[lane] = hardware_lamp
+                            
         except Exception: pass
 
 def classify_los(count: int) -> str:
@@ -725,6 +724,7 @@ with open(CSV_PATH, mode='w', newline='', encoding='utf-8') as f:
     writer.writerow(["Session Start Initialization Time", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
     writer.writerow([])
 
+# Boot up threads safely
 threading.Thread(target=keepalive_thread, daemon=True).start()
 threading.Thread(target=hub_heartbeat_thread, daemon=True).start()
 threading.Thread(target=run_flask_server, daemon=True).start() 
@@ -1023,9 +1023,6 @@ try:
         time.sleep(max(0.001, (1.0/TARGET_FPS) - (time.time() - t_loop)))
 
 finally:
-    # =============================================================
-    # 11. CLEANUP EXITS & FINAL ABSOLUTE GRAND TOTALS OVERVIEW REPORT
-    # =============================================================
     print("\n[STAP] 🛑 Shutdown Signal Intercepted. Closing background modules cleanly...")
     
     for r in readers: r.running = False
@@ -1033,7 +1030,7 @@ finally:
     video_writer.release()
     cv2.destroyAllWindows()
     
-    print(f"[STAP] 📊 Compiling absolute density data frames into master sheet ledger -> {CSV_PATH}")
+    print(f"[STAP] 📊 Compiling master dataset summary sheet ledger -> {CSV_PATH}")
     
     with analytics_lock:
         all_detected_classes = sorted(list(known_classes_seen))

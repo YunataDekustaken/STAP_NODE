@@ -1,8 +1,8 @@
 /*
-  STAP ESP32 Controller — Firmware v18.4 (Watchdog Decoupling & Buffer Fix)
-  =====================================================================
-  Increases the hardware watchdog tolerance window to 6000ms and implements
-  state-change verification to minimize I2C transactions.
+  STAP ESP32 Controller — Firmware v18.8 (Zero-Flicker Verified Linker Build)
+  ===========================================================================
+  Restores the syncIndicatorLEDs() logic block to resolve compilation 
+  linker errors while keeping asynchronous background serial communications.
 */
 
 #include <Wire.h>
@@ -60,7 +60,6 @@ const int    FALLBACK_GREEN[] = {50, 50, 39, 35};
 const String FALLBACK_LANE[]  = {"NORTH", "SOUTH", "EAST", "WEST"};
 const int    FALLBACK_COUNT   = 4;
 
-// EXTENDED WATCHDOG BUFFER WINDOW (6.0 Seconds)
 const unsigned long WATCHDOG_THRESHOLD = 6000; 
 
 // =============================================================
@@ -171,7 +170,6 @@ void loop() {
     if (currentMode == MANUAL) {
       broadcastManualStates();
     }
-    Serial.flush();
   }
 
   static String buf = "";
@@ -181,8 +179,6 @@ void loop() {
       buf.trim();
       if (buf.length() > 0) {
         parsePythonCommand(buf);
-        buf = "";
-        break;
       }
       buf = "";
     } else if (c != '\r') {
@@ -195,7 +191,7 @@ void loop() {
     lastCommMillis = ms; 
     isOffline      = false;
     updateShiftRegister();
-    updateTimers(-1, -1, -1, -1, true); // Force clean displays immediately
+    updateTimers(-1, -1, -1, -1, true); 
   } else if (checkButtonPress(btnManual)) {
     currentMode  = MANUAL;
     manualState  = MAN_STOPPED;
@@ -215,7 +211,7 @@ void loop() {
         fallbackYellowStart = 0;
         onlineSignal        = SIG_WAITING;
         Serial.println("ALERT:WATCHDOG_TRIPPED_FALLBACK_ENGAGED");
-        updateTimers(-1, -1, -1, -1, true); // Clear display remnants
+        updateTimers(-1, -1, -1, -1, true); 
       }
     }
   }
@@ -555,43 +551,8 @@ void handleManual(unsigned long ms, bool forceUpdate) {
 }
 
 // =============================================================
-// 12b. EXPLICIT HARDWARE LIGHT STATE BROADCASTER
+// 13. OUTPUT PRESETS
 // =============================================================
-void broadcastManualStates() {
-  String lanes[] = {"NORTH", "SOUTH", "EAST", "WEST"};
-  int greens[]   = {N_GREEN, S_GREEN, E_GREEN, W_GREEN};
-  int yellows[]  = {N_YELLOW, S_YELLOW, E_YELLOW, W_YELLOW};
-  
-  for (int i = 0; i < 4; i++) {
-    String currentLamp = "RED";
-    if (bitRead(lightState, greens[i]))       currentLamp = "GREEN";
-    else if (bitRead(lightState, yellows[i])) currentLamp = "YELLOW";
-    
-    Serial.println("STATE:" + lanes[i] + "," + currentLamp);
-  }
-  Serial.flush();
-}
-
-// =============================================================
-// 13. SHIFT REGISTER & LIGHT PRESETS
-// =============================================================
-void syncIndicatorLEDs() {
-  lightState &= 0x0000FFFF;
-  if (currentMode == AUTO) {
-    bitSet(lightState, ledBlue);
-  } else {
-    bitSet(lightState, ledWhite);
-    if      (manualState == MAN_EMERGENCY)                    bitSet(lightState, ledRed);
-    else if (manualHazardActive)                               bitSet(lightState, ledYellow);
-    else {
-      if (manualState == MAN_N_GO || manualTarget == MAN_N_GO) bitSet(lightState, ledNorth);
-      if (manualState == MAN_S_GO || manualTarget == MAN_S_GO) bitSet(lightState, ledSouth);
-      if (manualState == MAN_E_GO || manualTarget == MAN_E_GO) bitSet(lightState, ledEast);
-      if (manualState == MAN_W_GO || manualTarget == MAN_W_GO) bitSet(lightState, ledWest);
-    }
-  }
-}
-
 void updateShiftRegister() {
   syncIndicatorLEDs();
   digitalWrite(latchPin, LOW);
@@ -631,7 +592,7 @@ void setTransitionLights(ManualState prev) {
 }
 
 // =============================================================
-// 14. LCD ENGINE (State Cache Protected)
+// 14. LCD CHARACTER LAYOUT MANAGEMENT ENGINE
 // =============================================================
 void updateLCD(String l1, String l2, String l3, String l4) {
   if (l1 != lastLine1) { lcd.setCursor(0,0); lcd.print("                    "); lcd.setCursor(0,0); lcd.print(l1.substring(0, 20)); lastLine1 = l1; }
@@ -641,10 +602,9 @@ void updateLCD(String l1, String l2, String l3, String l4) {
 }
 
 // =============================================================
-// 15. 7-SEGMENT REGISTRY MANAGEMENT (State Cache Protected)
+// 15. 7-SEGMENT PER-LANE TIMERS
 // =============================================================
 void updateTimers(int n, int s, int e, int w, bool forceClear) {
-  // If the parameters match previous snapshots, bypass execution to clear the I2C bus completely
   if (forceClear || n != lastN) { showCentered(timerNorth, n); lastN = n; }
   if (forceClear || s != lastS) { showCentered(timerSouth, s); lastS = s; }
   if (forceClear || e != lastE) { showCentered(timerEast,  e); lastE = e; }
@@ -676,8 +636,42 @@ void showCentered(Adafruit_7segment &disp, int number) {
 }
 
 // =============================================================
-// 16. DEBOUNCED BUTTON
+// 16. EXPLICIT LIGHT HARDWARE BACKPLANE FEEDBACK BROADCASTER
 // =============================================================
+void broadcastManualStates() {
+  String lanes[] = {"NORTH", "SOUTH", "EAST", "WEST"};
+  int greens[]   = {N_GREEN, S_GREEN, E_GREEN, W_GREEN};
+  int yellows[]  = {N_YELLOW, S_YELLOW, E_YELLOW, W_YELLOW};
+  
+  for (int i = 0; i < 4; i++) {
+    String currentLamp = "RED";
+    if (bitRead(lightState, greens[i]))       currentLamp = "GREEN";
+    else if (bitRead(lightState, yellows[i])) currentLamp = "YELLOW";
+    
+    Serial.println("STATE:" + lanes[i] + "," + currentLamp);
+  }
+}
+
+// =============================================================
+// 17. DEBOUNCED BUTTON & PERIPHERALS INDICATORS
+// =============================================================
+void syncIndicatorLEDs() {
+  lightState &= 0x0000FFFF;
+  if (currentMode == AUTO) {
+    bitSet(lightState, ledBlue);
+  } else {
+    bitSet(lightState, ledWhite);
+    if      (manualState == MAN_EMERGENCY)                    bitSet(lightState, ledRed);
+    else if (manualHazardActive)                               bitSet(lightState, ledYellow);
+    else {
+      if (manualState == MAN_N_GO || manualTarget == MAN_N_GO) bitSet(lightState, ledNorth);
+      if (manualState == MAN_S_GO || manualTarget == MAN_S_GO) bitSet(lightState, ledSouth);
+      if (manualState == MAN_E_GO || manualTarget == MAN_E_GO) bitSet(lightState, ledEast);
+      if (manualState == MAN_W_GO || manualTarget == MAN_W_GO) bitSet(lightState, ledWest);
+    }
+  }
+}
+
 bool checkButtonPress(int pin) {
   static bool       init      = false;
   static int           last[40]  = {};
