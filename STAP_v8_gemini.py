@@ -1,9 +1,9 @@
 """
 STAP: Smart Traffic Automation Program
 =======================================
-v15.0 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
-        with Multi-Window UI, Transparent ROI Overlays, Periodic CSV Ledger Logs,
-        and Dynamic Lane Occupancy Spatial Area Percentages.
+v16.5 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
+        with Graphical Multi-Lens Traffic Lights Natively Mirroring Auto/Manual Modes,
+        Big Quadrant Approach Labels, and Real-Time Spatial Occupancy Tracking.
 """
 
 from ultralytics import YOLO
@@ -51,7 +51,7 @@ LANE_NAMES  = ["NORTH", "SOUTH", "EAST", "WEST"]
 PHASE_ORDER = ["NORTH", "SOUTH", "EAST", "WEST"]
 
 # --- DYNAMIC CSV TIME MATRIX TRACKING CONFIGS ---
-CSV_LOG_INTERVAL = 300 # Periodically log counts and occupancy metrics to CSV every 5 minutes
+CSV_LOG_INTERVAL = 300 
 last_csv_log_time = time.time()
 
 # --- ADVANCED HUD LANE-SPECIFIC INTERSECTION COLOR REGISTERS (BGR Format) ---
@@ -87,7 +87,7 @@ RAW_HIGH_RES_ROIS = {
 }
 
 ROI_POLYGONS = {}
-ROI_STATIC_AREAS = {} # Pre-calculates exact spatial capacities in terms of pixel sizes
+ROI_STATIC_AREAS = {} 
 print("[STAP] Calibrating matching ROI geometry scales automatically...")
 
 for idx, lane in enumerate(LANE_NAMES):
@@ -108,9 +108,7 @@ for idx, lane in enumerate(LANE_NAMES):
     downscaled_poly = poly_points.astype(np.int32)
     
     ROI_POLYGONS[lane] = downscaled_poly
-    # Calculate total mathematical pixel volume inside the polygon
     ROI_STATIC_AREAS[lane] = float(cv2.contourArea(downscaled_poly))
-    print(f"[STAP] Pre-Calculated Static Spatial Boundary Area for {lane}: {ROI_STATIC_AREAS[lane]:,.1f} Pixels")
 
 BASE_GREEN = {"NORTH": 50, "SOUTH": 50, "EAST": 39, "WEST": 35}
 
@@ -171,9 +169,10 @@ latest_frames  = [None, None, None, None]
 cached_boxes   = {lane: [] for lane in LANE_NAMES}
 vehicle_counts = {lane: 0  for lane in LANE_NAMES}
 lane_statuses  = {lane: "CLEAR" for lane in LANE_NAMES}
-
-# Dynamic Real-time Occupancy Percentage Register Buckets
 lane_live_occupancy_pct = {lane: 0.0 for lane in LANE_NAMES}
+
+# Thread-Safe Storage to preserve manual routing adjustments
+manual_lane_lights = {lane: "RED" for lane in LANE_NAMES}
 
 analytics_lock = threading.Lock()
 global_analytics_registry = {lane: collections.defaultdict(int) for lane in LANE_NAMES}
@@ -344,7 +343,6 @@ class BackgroundAIProcessor(threading.Thread):
                         
                         temp_counts[lane] += 1
                         
-                        # --- DYNAMIC OCCUPANCY AREA GEOMETRY SUMMATION LAYER ---
                         box_width = bx2 - bx1
                         box_height = by2 - by1
                         temp_occupancy_pixels[lane] += float(box_width * box_height)
@@ -377,7 +375,6 @@ class BackgroundAIProcessor(threading.Thread):
                     lane: ("EMERGENCY" if emg_buffer.is_confirmed(lane) else temp_statuses[lane])
                     for lane in LANE_NAMES
                 }
-                # Calculate the percentage ratio of vehicle mass pixels to total road polygon boundaries
                 for lane in LANE_NAMES:
                     static_total = ROI_STATIC_AREAS[lane]
                     if static_total > 0:
@@ -473,6 +470,15 @@ def compute_green_time(lane: str, rain: bool) -> int:
 
 def compute_red_time(lane: str, greens: dict) -> int:
     return sum(greens[l] + YELLOW_TIME + ALL_RED_TIME for l in PHASE_ORDER if l != lane)
+
+def merge_manual_light_state(lane: str, state: str):
+    with result_lock:
+        manual_lane_lights[lane] = state.upper()
+
+def reset_all_manual_lights_to_red():
+    with result_lock:
+        for lane in LANE_NAMES:
+            manual_lane_lights[lane] = "RED"
 
 def emergency_lane():
     with result_lock:
@@ -588,6 +594,7 @@ def control_mode():
     elif mode == 'manual':
         manual_override = True
         send_to_esp32('MODE:MANUAL')
+        reset_all_manual_lights_to_red()
     elif mode == 'hazard':
         manual_override = True
         send_to_esp32('MODE:HAZARD')
@@ -604,9 +611,10 @@ def control_light():
     state = data.get('state', '').lower()
 
     if lane not in LANE_NAMES or state not in ['red', 'yellow', 'green']:
-        return jsonify({'success': False, 'message': 'Invalid fields.'}), 400
+        return jsonify({'success': False, 'message': 'Invalid parameters.'}), 400
 
     send_to_esp32(f'MANUAL_LIGHT:{lane},{state.upper()}')
+    merge_manual_light_state(lane, state) # Sync manual commands into register maps
     return jsonify({'success': True, 'lane': lane, 'state': state})
 
 @app.route('/control/emergency', methods=['POST', 'OPTIONS'])
@@ -705,7 +713,6 @@ def keepalive_thread():
             hub_tick = 0
             post_to_hub()
 
-# --- PRE-INITIALIZE FILE STRUCT WITH HEADERS ---
 CSV_PATH = os.path.join(CURRENT_RUN_DIR, "traffic_summary.csv")
 with open(CSV_PATH, mode='w', newline='', encoding='utf-8') as f:
     writer = csv.writer(f)
@@ -750,7 +757,8 @@ try:
             local_boxes    = {k: list(v) for k, v in cached_boxes.items()}
             local_counts   = vehicle_counts.copy()
             local_statuses = lane_statuses.copy()
-            local_occupancy = lane_live_occupancy_pct.copy() # Safe snapshot fetch
+            local_occupancy = lane_live_occupancy_pct.copy()
+            local_manual_lights = manual_lane_lights.copy() # Capture thread-safe copy
 
         with phase_lock:
             snap_lane    = PHASE_ORDER[current_phase_idx]
@@ -784,6 +792,57 @@ try:
             cv2.addWeighted(overlay, ROI_ALPHA, fr, 1.0 - ROI_ALPHA, 0, fr)
             cv2.polylines(fr, [ROI_POLYGONS[lane]], isClosed=True, color=lane_color, thickness=2)
 
+            # --- BIG APPROACH IDENTIFIER TEXT HUD LAYER ---
+            label_text = f"--- {lane} ---"
+            text_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_DUPLEX, 0.75, 2)[0]
+            text_x = (CAM_WIDTH - text_size[0]) // 2
+            # High-visibility backing drop shadow accent bars
+            cv2.putText(fr, label_text, (text_x + 1, 31), cv2.FONT_HERSHEY_DUPLEX, 0.75, (0, 0, 0), 2, cv2.LINE_AA)
+            cv2.putText(fr, label_text, (text_x, 30), cv2.FONT_HERSHEY_DUPLEX, 0.75, lane_color, 2, cv2.LINE_AA)
+
+            # --- ENGINE ARCHITECTURE FOR HUD TRAFFIC LIGHT DRAWING PASS ---
+            tl_x, tl_y = 580, 15
+            br_x, br_y = 625, 140
+            cv2.rectangle(fr, (tl_x, tl_y), (br_x, br_y), (35, 35, 35), -1)   
+            cv2.rectangle(fr, (tl_x, tl_y), (br_x, br_y), (100, 100, 100), 1) 
+
+            # Map signal parameters adaptively across state constraints
+            light_is_red    = False
+            light_is_yellow = False
+            light_is_green  = False
+
+            if manual_override:
+                # Mirror real-time values parsed directly via incoming serial routing commands
+                current_manual_state = local_manual_lights.get(lane, "RED")
+                if current_manual_state == "GREEN":     light_is_green = True
+                elif current_manual_state == "YELLOW": light_is_yellow = True
+                else:                                  light_is_red = True
+            else:
+                # Maintain standard sequential automated state machine logic
+                if snap_state == "ALL_RED":
+                    light_is_red = True
+                elif lane == snap_lane:
+                    if snap_state == "GREEN":   light_is_green = True
+                    elif snap_state == "YELLOW": light_is_yellow = True
+                else:
+                    light_is_red = True 
+
+            red_c    = (602, 36)
+            yellow_c = (602, 78)
+            green_c  = (602, 119)
+            lens_radius = 15
+
+            r_val = (0, 0, 255)   if light_is_red    else (0, 0, 50)
+            y_val = (0, 255, 255) if light_is_yellow else (0, 50, 50)
+            g_val = (0, 255, 0)   if light_is_green  else (0, 50, 0)
+
+            cv2.circle(fr, red_c, lens_radius, r_val, -1)
+            cv2.circle(fr, red_c, lens_radius, (120, 120, 120), 1) 
+            cv2.circle(fr, yellow_c, lens_radius, y_val, -1)
+            cv2.circle(fr, yellow_c, lens_radius, (120, 120, 120), 1)
+            cv2.circle(fr, green_c, lens_radius, g_val, -1)
+            cv2.circle(fr, green_c, lens_radius, (120, 120, 120), 1)
+
             for b in local_boxes[lane]:
                 fx1, fy1, fx2, fy2 = b["coords"]
                 cv2.rectangle(fr, (fx1, fy1), (fx2, fy2), b["color"], 2)
@@ -797,28 +856,26 @@ try:
             with analytics_lock:
                 lane_lifetime_total = sum(global_analytics_registry[lane].values())
 
-            # Print spatial density metrics directly inside the HUD layer matrix layout channels
-            cv2.putText(fr, f"APPROACH: {lane} | LOS: {los} | LIVE QUEUE: {local_counts[lane]}",
+            cv2.putText(fr, f"LOS: {los} | LIVE QUEUE: {local_counts[lane]}",
                         (8, CAM_HEIGHT-42), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255,255,255), 1)
             cv2.putText(fr, f"ROI SPATIAL DENSITY: {local_occupancy[lane]:.1f}%",
                         (8, CAM_HEIGHT-26), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
-            cv2.putText(fr, f"G:{adj}s(base:{base}s) R:{red}s | LOGGED UNIQUE:{lane_lifetime_total}",
+            cv2.putText(fr, f"G:{adj}s(base:{base}s) R:{red}s | LOGGED UNIQUE: {lane_lifetime_total}",
                         (8, CAM_HEIGHT-12), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200,255,200), 1)
 
             is_emg_confirmed = local_statuses[lane] == "EMERGENCY"
             is_emg_charging  = emg_buffer.is_charging(lane)
 
-            if is_emg_confirmed: sc = (0, 0, 255); status_text = f"{lane}: EMERGENCY"
+            if is_emg_confirmed: sc = (0, 0, 255); status_text = f"EMERGENCY PRIORITY"
             elif is_emg_charging:
-                sc = (0, 165, 255); streak = emg_buffer.streak_elapsed(lane)
-                status_text = f"{lane}: EMG? [{streak:.1f}/{EMERGENCY_SUSTAIN_SECONDS}s]"
-            elif lane == snap_lane:
-                sc = (0, 255, 0) if snap_state == "GREEN" else ((0, 255, 255) if snap_state == "YELLOW" else (0, 0, 255))
-                status_text = f"{lane}: [{snap_state}]"
+                streak = emg_buffer.streak_elapsed(lane)
+                status_text = f"EMG VEHICLE DETECTED [{streak:.1f}s]"
+            elif manual_override:
+                status_text = f"MANUAL SELECTION active"
             else:
-                sc = (140, 140, 140); status_text = f"{lane}: {local_statuses[lane]}"
+                status_text = f"AUTOMATED STATE: RUNNING"
 
-            cv2.putText(fr, status_text, (8, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, sc, 2)
+            cv2.putText(fr, status_text, (8, CAM_HEIGHT-58), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (220, 220, 220), 1)
 
         grid = np.vstack((np.hstack((drawn[0], drawn[1])), np.hstack((drawn[2], drawn[3]))))
         mode_label = "OFFLINE/FALLBACK" if is_offline else ("MANUAL OVERRIDE" if manual_override else "AUTO (SMART AI)")
@@ -828,8 +885,13 @@ try:
         elif rain_detected: mode_label += " + CONDITIONAL RAIN BUFFERS"
 
         cv2.putText(grid, f"SYSTEM MODE: {mode_label}", (15, grid.shape[0]-50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
-        cv2.putText(grid, f"ACTIVE PHASE: {snap_lane} [{snap_state}] | State Clock Remaining: {disp_remain}s | Target Ceiling Green: {snap_green}s",
-                    (15, grid.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.62, hud_color, 2)
+        
+        if manual_override:
+            cv2.putText(grid, f"ACTIVE INTERSECTION ROUTING OVERRIDE CONTROL VIA API HANDSHAKE",
+                        (15, grid.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (0, 200, 255), 2)
+        else:
+            cv2.putText(grid, f"ACTIVE PHASE: {snap_lane} | State Clock Remaining: {disp_remain}s | Target Ceiling Green: {snap_green}s",
+                        (15, grid.shape[0]-20), cv2.FONT_HERSHEY_SIMPLEX, 0.62, hud_color, 2)
 
         video_writer.write(grid)
         cv2.imshow("STAP Local Engine Monitor", grid)
@@ -848,7 +910,6 @@ try:
 
         with analytics_lock:
             classes_to_render = sorted(list(known_classes_seen))
-            # Format includes Density markers dynamically inside tabular grids
             cv2.putText(dashboard_img, f"{'CLASS':<14}{'NORTH':<8}{'SOUTH':<8}{'EAST':<8}{'WEST':<8}{'TOTAL':<6}", 
                         (20, 85), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1)
             cv2.line(dashboard_img, (15, 95), (db_w-15, 95), (70, 70, 70), 1)
@@ -877,7 +938,6 @@ try:
 
             cv2.line(dashboard_img, (15, db_h-75), (db_w-15, db_h-75), (55, 55, 55), 1)
             
-            # Map dynamic active lane spatial queue metrics layout rows
             density_row = f"{'LIVE DENSITY':<14}"\
                           f"{local_occupancy['NORTH']:.1f}%  "\
                           f"{local_occupancy['SOUTH']:.1f}%  "\
@@ -897,7 +957,7 @@ try:
         cv2.imshow("STAP Analytics Dashboard", dashboard_img)
 
         # =============================================================
-        # 10c. AUTOMATED RUN PERIODIC LEDGER EXPORT CONDITION ENGINE
+        # 10c. AUTOMATED RUN PERIODIC LEDGER EXPORT
         # =============================================================
         if now - last_csv_log_time >= CSV_LOG_INTERVAL:
             last_csv_log_time = now
