@@ -1,8 +1,8 @@
 /*
-  STAP ESP32 Controller — Firmware v17.5 (Synchronized Feedback Engine)
+  STAP ESP32 Controller — Firmware v18.0 (Watchdog Fallback Integration)
   =====================================================================
-  Natively broadcasts absolute hardware light states back across the 
-  serial channel during Manual Mode triggers to synchronize virtual HUDs.
+  Implements a hardware watchdog monitoring incoming Python keepalive pulses.
+  Forces an automatic fallback to traditional cycle loops if data drops for >= 4000ms.
 */
 
 #include <Wire.h>
@@ -26,7 +26,6 @@ const int ledEast   = 26; const int ledNorth  = 27;
 const int latchPin = 5;  const int clockPin = 18;
 const int dataPin  = 19; const int oePin    = 4;
 
-// Per-lane timer display I2C addresses
 #define ADDR_NORTH   0x70
 #define ADDR_SOUTH   0x72
 #define ADDR_EAST    0x74
@@ -45,7 +44,6 @@ const int RAIN_THRESHOLD = 3000;
 // =============================================================
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
-// Per-lane countdown displays
 Adafruit_7segment timerNorth = Adafruit_7segment();
 Adafruit_7segment timerSouth = Adafruit_7segment();
 Adafruit_7segment timerEast  = Adafruit_7segment();
@@ -62,7 +60,8 @@ const int    FALLBACK_GREEN[] = {50, 50, 39, 35};
 const String FALLBACK_LANE[]  = {"NORTH", "SOUTH", "EAST", "WEST"};
 const int    FALLBACK_COUNT   = 4;
 
-const unsigned long DATA_TIMEOUT = 30000;
+// Watchdog tripwire timing threshold parameter configured to 4.0 seconds max latency allowed
+const unsigned long WATCHDOG_THRESHOLD = 4000; 
 
 // =============================================================
 // 4. STATE VARIABLES
@@ -70,28 +69,24 @@ const unsigned long DATA_TIMEOUT = 30000;
 enum Mode { AUTO, MANUAL };
 Mode currentMode = AUTO;
 
-// ── Auto online signal state ──────────────────────────────────
 enum OnlineSignal { SIG_GREEN, SIG_YELLOW, SIG_WAITING };
 OnlineSignal  onlineSignal      = SIG_WAITING;
 String        activeLane        = "NORTH";
 int           greenCountdown    = 0;
 unsigned long yellowStartMillis = 0;
 
-// ── Offline fallback state ────────────────────────────────────
-unsigned long lastCommMillis      = 0;
-unsigned long silenceStartMillis  = 0;
-bool          isOffline           = false;
-int           fallbackIdx         = 0;
-int           fallbackCountdown   = 50;
-bool          fallbackInYellow    = false;
-unsigned long fallbackYellowStart = 0;
+// ── Watchdog Fallback States ──────────────────────────────────
+unsigned long lastCommMillis       = 0; 
+bool          isOffline            = false;
+int           fallbackIdx          = 0;
+int           fallbackCountdown    = 50;
+bool          fallbackInYellow     = false;
+unsigned long fallbackYellowStart  = 0;
 
-// ── Shared ────────────────────────────────────────────────────
 unsigned long lastTickMillis    = 0;
 unsigned long lastTelemetryTime = 0;
 bool          rainDetected      = false;
 
-// ── LCD cache boundaries (Deduplication system) ───────────────
 String lastLine1 = "", lastLine2 = "", lastLine3 = "", lastLine4 = "";
 
 // =============================================================
@@ -147,7 +142,7 @@ void setup() {
   timerWest.begin(ADDR_WEST);   timerWest.setBrightness(10);
 
   lcd.init(); lcd.backlight();
-  updateLCD("====================", " ESP32 TRAFFIC CTRL ", "   SYSTEM BOOTING   ", "====================");
+  updateLCD("====================", " ESP32 TRAFFIC CTRL ", "   WATCHDOG ACTIVE  ", "====================");
 
   pinMode(rainSensorPin,  INPUT);
   pinMode(btnAuto,        INPUT_PULLUP); pinMode(btnManual,    INPUT_PULLUP);
@@ -156,7 +151,7 @@ void setup() {
   pinMode(btnGoSouth,     INPUT_PULLUP); pinMode(btnGoWest,    INPUT_PULLUP);
 
   setAllRed();
-  lastCommMillis = millis();
+  lastCommMillis = millis(); // Start watchdog timer baseline register snapshot
   delay(1000);
   digitalWrite(oePin, LOW);
 }
@@ -170,11 +165,7 @@ void loop() {
 
   if (ms - lastTelemetryTime >= 400) {
     lastTelemetryTime = ms;
-    Serial.println(
-      "RAIN:" + String(rainDetected ? "1" : "0") +
-      ",MODE:" + String(currentMode == MANUAL ? "MANUAL" : "AUTO")
-    );
-    // Explicitly pulse manual lamp verification updates back down stream channels
+    Serial.println("RAIN:" + String(rainDetected ? "1" : "0") + ",MODE:" + String(currentMode == MANUAL ? "MANUAL" : "AUTO"));
     if (currentMode == MANUAL) {
       broadcastManualStates();
     }
@@ -198,10 +189,9 @@ void loop() {
   }
 
   if (checkButtonPress(btnAuto)) {
-    currentMode        = AUTO;
-    lastCommMillis     = ms;
-    isOffline          = false;
-    silenceStartMillis = 0;
+    currentMode    = AUTO;
+    lastCommMillis = ms; // Reset countdown reference arrays on mode override button engagement
+    isOffline      = false;
     updateShiftRegister();
   } else if (checkButtonPress(btnManual)) {
     currentMode  = MANUAL;
@@ -211,20 +201,18 @@ void loop() {
     broadcastManualStates();
   }
 
+  // --- CRITICAL IMPLEMENTATION LAYER: AUTOMATED WATCHDOG EVALUATION TRIGGER ---
   if (currentMode == AUTO) {
-    bool nowSilent = (ms - lastCommMillis > 1000);
-    if (!nowSilent) {
-      silenceStartMillis = 0;
-      isOffline          = false;
-    } else {
-      if (silenceStartMillis == 0) silenceStartMillis = ms;
-      if (!isOffline && (ms - silenceStartMillis >= DATA_TIMEOUT)) {
-        isOffline            = true;
-        fallbackIdx          = 0;
-        fallbackCountdown    = FALLBACK_GREEN[0];
-        fallbackInYellow     = false;
-        fallbackYellowStart  = 0;
-        onlineSignal         = SIG_WAITING;
+    if (ms - lastCommMillis >= WATCHDOG_THRESHOLD) {
+      if (!isOffline) {
+        // Python process communication link loss detected: Forcefully trigger Fallback Loop Mode
+        isOffline           = true;
+        fallbackIdx         = 0;
+        fallbackCountdown   = FALLBACK_GREEN[0];
+        fallbackInYellow    = false;
+        fallbackYellowStart = 0;
+        onlineSignal        = SIG_WAITING;
+        Serial.println("ALERT:WATCHDOG_TRIPPED_FALLBACK_ENGAGED");
       }
     }
   }
@@ -251,25 +239,27 @@ void loop() {
 }
 
 // =============================================================
-// 9. PYTHON COMMAND PARSER (With Verification Streaming Echoes)
+// 9. PYTHON COMMAND PARSER
 // =============================================================
 void parsePythonCommand(String msg) {
+  // Catch any valid incoming frame data signature token
   if (msg.startsWith("PHASE:")   ||
       msg.startsWith("YELLOW:")  ||
       msg.startsWith("PING:")    ||
-      msg.startsWith("DISPLAY:") ||
       msg.startsWith("MODE:")    ||
       msg.startsWith("MANUAL_LIGHT:") ||
       msg.startsWith("HAZARD:")  ||
       msg.startsWith("EMERGENCY_OVERRIDE:")) {
-    lastCommMillis     = millis();
-    silenceStartMillis = 0;
-    isOffline          = false;
+      
+    // Resets watchdog window accumulator register immediately
+    lastCommMillis = millis();
+    isOffline      = false;
   } else {
     return;
   }
 
   if (msg.startsWith("PING:")) {
+    // Handled purely by the watchdog time reset layer above
     return;
   }
 
@@ -316,43 +306,29 @@ void parsePythonCommand(String msg) {
 
     String lane  = payload.substring(0, commaIdx);
     String state = payload.substring(commaIdx + 1);
-    lane.trim();
-    state.trim();
+    lane.trim(); state.trim();
 
     if      (lane == "NORTH" && state == "GREEN")  { manualState = MAN_N_GO; setNorthGo(); }
     else if (lane == "SOUTH" && state == "GREEN")  { manualState = MAN_S_GO; setSouthGo(); }
     else if (lane == "EAST"  && state == "GREEN")  { manualState = MAN_E_GO; setEastGo();  }
     else if (lane == "WEST"  && state == "GREEN")  { manualState = MAN_W_GO; setWestGo();  }
-    else if (state == "RED") {
-      manualState = MAN_STOPPED;
-      setAllRed();
-    }
-    else if (state == "YELLOW") {
-      setYellow(lane);
-    }
+    else if (state == "RED") { manualState = MAN_STOPPED; setAllRed(); }
+    else if (state == "YELLOW") { setYellow(lane); }
 
     updateTimers(-1, -1, -1, -1);
-    broadcastManualStates(); // Send absolute verification echoes back instantly
+    broadcastManualStates(); 
     return;
   }
 
   if (msg.startsWith("EMERGENCY_OVERRIDE:")) {
     String lane = msg.substring(19);
     lane.trim();
-
     currentMode        = AUTO;
     manualHazardActive = false;
-    isOffline          = false;
-
     onlineSignal      = SIG_YELLOW;
     yellowStartMillis = millis();
     setYellow(activeLane);
-
     activeLane = lane;
-    return;
-  }
-
-  if (msg.startsWith("DISPLAY:")) {
     return;
   }
 
@@ -425,27 +401,15 @@ void runAutoOnline(unsigned long ms) {
   }
 
   String title  = rainDetected ? "-- AUTO (+RAIN) --" : "-- AUTO (SMART AI) --";
-  String sigStr;
-  int    disp   = 0;
+  String sigStr = (onlineSignal == SIG_GREEN) ? "GREEN" : ((onlineSignal == SIG_YELLOW) ? "YELLOW" : "--- ALL RED ---");
+  int    disp   = (onlineSignal == SIG_GREEN) ? greenCountdown : ((onlineSignal == SIG_YELLOW) ? max(0, YELLOW_TIME - (int)((ms - yellowStartMillis) / 1000)) : 0);
 
-  if (onlineSignal == SIG_GREEN) {
-    sigStr = "GREEN";
-    disp   = greenCountdown;
-  } else if (onlineSignal == SIG_YELLOW) {
-    sigStr = "YELLOW";
-    disp   = max(0, YELLOW_TIME - (int)((ms - yellowStartMillis) / 1000));
-  } else {
-    sigStr = "--- ALL RED ---";
-  }
-
-  String cntLine = (onlineSignal == SIG_WAITING)
-    ? "Switching lane..."
-    : "Countdown: " + String(disp) + "s";
+  String cntLine = (onlineSignal == SIG_WAITING) ? "Switching lane..." : "Countdown: " + String(disp) + "s";
   updateLCD(title, "ACTIVE: " + activeLane, "SIGNAL: " + sigStr, cntLine);
 }
 
 // =============================================================
-// 11. AUTO FALLBACK MODE
+// 11. AUTO FALLBACK MODE (watchdog driven)
 // =============================================================
 void runAutoFallback(unsigned long ms) {
   if (fallbackInYellow) {
@@ -472,9 +436,7 @@ void runAutoFallback(unsigned long ms) {
     else if (fbLane == "WEST")  setWestGo();
   }
 
-  int currentRemaining = fallbackInYellow
-    ? max(0, YELLOW_TIME - (int)((ms - fallbackYellowStart) / 1000))
-    : fallbackCountdown;
+  int currentRemaining = fallbackInYellow ? max(0, YELLOW_TIME - (int)((ms - fallbackYellowStart) / 1000)) : fallbackCountdown;
 
   int timers[4];
   for (int i = 0; i < 4; i++) {
@@ -482,9 +444,7 @@ void runAutoFallback(unsigned long ms) {
       timers[i] = currentRemaining; 
     } else {
       int totalWait = currentRemaining;
-      if (!fallbackInYellow) {
-        totalWait += YELLOW_TIME; 
-      }
+      if (!fallbackInYellow) totalWait += YELLOW_TIME; 
       
       int checkIdx = (fallbackIdx + 1) % 4;
       while (checkIdx != i) {
@@ -498,9 +458,7 @@ void runAutoFallback(unsigned long ms) {
   updateTimers(timers[0], timers[1], timers[2], timers[3]);
 
   String sig  = fallbackInYellow ? "YELLOW" : "GREEN";
-  updateLCD("-- AUTO FALLBACK --", "NETWORK LOSS",
-            "Active: " + fbLane + " [" + sig + "]",
-            "Countdown: " + String(currentRemaining) + "s");
+  updateLCD("⚠️ WATCHDOG FALLBACK", "COMMUNICATION LOSS", "Active: " + fbLane + " [" + sig + "]", "Countdown: " + String(currentRemaining) + "s");
 }
 
 // =============================================================
@@ -573,7 +531,6 @@ void handleManual(unsigned long ms) {
 // 12b. EXPLICIT HARDWARE LIGHT STATE BROADCASTER
 // =============================================================
 void broadcastManualStates() {
-  // Evaluates exactly which shift register bits are active and prints the matching status
   String lanes[] = {"NORTH", "SOUTH", "EAST", "WEST"};
   int greens[]   = {N_GREEN, S_GREEN, E_GREEN, W_GREEN};
   int yellows[]  = {N_YELLOW, S_YELLOW, E_YELLOW, W_YELLOW};
@@ -657,7 +614,7 @@ void updateLCD(String l1, String l2, String l3, String l4) {
 }
 
 // =============================================================
-// 15. 7-SEGMENT PER-LANE TIMERS (Supports 3 Digits)
+// 15. 7-SEGMENT PER-LANE TIMERS
 // =============================================================
 void updateTimers(int n, int s, int e, int w) {
   showCentered(timerNorth, n); showCentered(timerSouth, s);

@@ -1,9 +1,9 @@
 """
 STAP: Smart Traffic Automation Program
 =======================================
-v17.2 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
-        with Clean Top Quad Labels, Real-Time Hardware Signal Sync Mirroring,
-        and Dynamic Spatial Occupancy Tracking.
+v18.0 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
+        with Hardware Watchdog Keepalive Pings (4000ms Fail-Safe Loop),
+        Clean Quadrant Labels, and Real-Time Spatial Occupancy Tracking.
 """
 
 from ultralytics import YOLO
@@ -77,7 +77,7 @@ LOOP_VIDEOS  = True
 CAM_WIDTH    = 640
 CAM_HEIGHT   = 480
 TARGET_FPS   = 30
-DATA_TIMEOUT = 5.0
+DATA_TIMEOUT = 4.0  # Aligned to exact 4.0-second Hardware Watchdog tripwire boundaries
 
 # --- AUTOMATED REGION OF INTEREST (ROI) ENGINE ---
 RAW_HIGH_RES_ROIS = {
@@ -174,7 +174,6 @@ vehicle_counts = {lane: 0  for lane in LANE_NAMES}
 lane_statuses  = {lane: "CLEAR" for lane in LANE_NAMES}
 lane_live_occupancy_pct = {lane: 0.0 for lane in LANE_NAMES}
 
-# Master Light States (Populated strictly by data packets streaming back from ESP32)
 manual_lane_lights = {lane: "RED" for lane in LANE_NAMES}
 
 analytics_lock = threading.Lock()
@@ -677,7 +676,6 @@ def start_yellow(lane: str):
         phase_state       = "YELLOW"
         yellow_start_time = time.time()
     send_to_esp32(f"YELLOW:{lane}")
-    send_to_esp32(f"DISPLAY:YELLOW,{YELLOW_TIME}")
 
 def start_all_red():
     global phase_state, all_red_start_time
@@ -685,7 +683,6 @@ def start_all_red():
         phase_state        = "ALL_RED"
         all_red_start_time = time.time()
     send_to_esp32("PHASE:ALL_RED,DURATION:2")
-    send_to_esp32("DISPLAY:OFF")
     print("[STAP] 🚨 All-Red clearance safety interval initialized intersection-wide.")
 
 def start_green(next_lane: str, duration: int):
@@ -698,7 +695,6 @@ def start_green(next_lane: str, duration: int):
         all_red_start_time = 0.0
         committed_green    = duration
     send_to_esp32(f"PHASE:{next_lane},DURATION:{duration}")
-    send_to_esp32("DISPLAY:OFF")
 
 def advance_phase():
     global current_phase_idx
@@ -711,12 +707,17 @@ def advance_phase():
     green = compute_green_time(next_lane, rain_detected)
     start_green(next_lane, green)
 
+# --- CRITICAL SYSTEM REFACTOR: CONTINUOUS KEEPALIVE TRANSMITTER ---
 def keepalive_thread():
     hub_tick = 0
     while True:
         time.sleep(PING_INTERVAL)
-        with phase_lock: active = PHASE_ORDER[current_phase_idx]
+        with phase_lock: 
+            active = PHASE_ORDER[current_phase_idx]
+        
+        # Continuous non-blocking transmission pulses feeding the hardware safety watchdog
         send_to_esp32(f"PING:{active}")
+        
         hub_tick += 1
         if hub_tick >= HUB_INTERVAL_TICKS:
             hub_tick = 0
@@ -791,7 +792,6 @@ try:
         display_greens = {lane: compute_green_time(lane, rain_detected) for lane in LANE_NAMES}
         display_greens[snap_lane] = snap_green
 
-        # --- DYNAMIC HAZARD BLINK OVERRIDE FILTER PATTERN CHANNELS ---
         if all(local_manual_lights.get(l) == "YELLOW" for l in LANE_NAMES):
             last_hazard_blink_time = now
             
@@ -807,14 +807,12 @@ try:
             cv2.addWeighted(overlay, ROI_ALPHA, fr, 1.0 - ROI_ALPHA, 0, fr)
             cv2.polylines(fr, [ROI_POLYGONS[lane]], isClosed=True, color=lane_color, thickness=2)
 
-            # --- BIG APPROACH IDENTIFIER TEXT HUD LAYER (Refactored Clean Labels) ---
             label_text = f"{lane}"
             text_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_DUPLEX, 0.75, 2)[0]
             text_x = (CAM_WIDTH - text_size[0]) // 2
             cv2.putText(fr, label_text, (text_x + 1, 31), cv2.FONT_HERSHEY_DUPLEX, 0.75, (0, 0, 0), 2, cv2.LINE_AA)
             cv2.putText(fr, label_text, (text_x, 30), cv2.FONT_HERSHEY_DUPLEX, 0.75, lane_color, 2, cv2.LINE_AA)
 
-            # --- ENGINE ARCHITECTURE FOR HUD TRAFFIC LIGHT DRAWING PASS ---
             tl_x, tl_y = 580, 15
             br_x, br_y = 625, 140
             cv2.rectangle(fr, (tl_x, tl_y), (br_x, br_y), (35, 35, 35), -1)   
@@ -1034,7 +1032,7 @@ try:
 
 finally:
     # =============================================================
-    # 11. CLEANUP EXITS & FINAL ABSOLUTE GRAND TOTALS SUMMARY REPORT
+    # 11. CLEANUP EXITS & FINAL ABSOLUTE GRAND TOTALS OVERVIEW REPORT
     # =============================================================
     print("\n[STAP] 🛑 Shutdown Signal Intercepted. Closing background modules cleanly...")
     
