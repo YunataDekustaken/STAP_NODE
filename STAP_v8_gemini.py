@@ -53,16 +53,23 @@ CAM_HEIGHT   = 480
 TARGET_FPS   = 30
 DATA_TIMEOUT = 5.0
 
-# Whole-Frame Polygon ROIs matching the exact window coordinates
+# 💡 NOTE FOR FUTURE ROI UPGRADES:
+# -----------------------------------------------------------------------------------
+# To update these ROIs later using coordinates extracted from your video analyzer or tool,
+# format them exactly as standard NumPy arrays containing nested coordinate lists: [[X1, Y1], [X2, Y2], ...].
+# Ensure you enforce `dtype=np.int32` so the OpenCV detection functions do not throw calculation exceptions.
+# They can have any number of vertex points (4 points, 7 points, 9 points, etc.).
+# -----------------------------------------------------------------------------------
 ROI_POLYGONS = {
-    "NORTH": np.array([[int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.2)], [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.2)], 
-                       [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.95)], [int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.95)]], dtype=np.int32),
-    "SOUTH": np.array([[int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.2)], [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.2)], 
-                       [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.95)], [int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.95)]], dtype=np.int32),
-    "EAST" : np.array([[int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.2)], [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.2)], 
-                       [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.95)], [int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.95)]], dtype=np.int32),
-    "WEST" : np.array([[int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.2)], [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.2)], 
-                       [int(CAM_WIDTH*0.9), int(CAM_HEIGHT*0.95)], [int(CAM_WIDTH*0.1), int(CAM_HEIGHT*0.95)]], dtype=np.int32),
+    "WEST": np.array([[683, 1534], [1853, 427], [2526, 424], [2748, 1605]], dtype=np.int32),
+    
+    "NORTH": np.array([[2173, 2159], [2109, 999], [2065, 450], [2017, 137], [1779, 134], 
+                       [1567, 464], [991, 1263], [497, 1880], [761, 2155]], dtype=np.int32),
+    
+    "EAST": np.array([[7, 1713], [-1, 1181], [683, 528], [932, 320], [1181, 175], 
+                      [1835, 175], [2303, 1735]], dtype=np.int32),
+    
+    "SOUTH": np.array([[579, 897], [601, 528], [869, 318], [1250, 310], [1361, 927]], dtype=np.int32)
 }
 
 # Engineered base green times (from traffic study)
@@ -237,9 +244,9 @@ class BackgroundAIProcessor(threading.Thread):
     def run(self):
         global cached_boxes, vehicle_counts, lane_statuses
         while self.running:
-            temp_counts   = {l: 0 for l in LANE_NAMES}
+            temp_counts = {l: 0 for l in LANE_NAMES}
             temp_statuses = {l: "CLEAR" for l in LANE_NAMES}
-            temp_boxes    = {l: [] for l in LANE_NAMES}
+            temp_boxes = {l: [] for l in LANE_NAMES}
 
             for idx, lane in enumerate(LANE_NAMES):
                 img = None
@@ -448,7 +455,6 @@ def post_to_hub():
                     "buses":              buses,
                     "emergency_vehicles": emergency,
                     "congestion":         CONGESTION_MAP.get(los, "free_flow"),
-                    "snapshot_time":      datetime.now().isoformat(),
                     "snapshot_time":      datetime.now().isoformat(),
                 }
                 requests.post(STAP_HUB_URL, json=body, headers=headers, timeout=1.5)
