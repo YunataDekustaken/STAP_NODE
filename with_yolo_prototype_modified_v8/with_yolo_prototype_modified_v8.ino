@@ -1,8 +1,8 @@
 /*
-  STAP ESP32 Controller — Firmware v18.8 (Zero-Flicker Verified Linker Build)
-  ===========================================================================
-  Restores the syncIndicatorLEDs() logic block to resolve compilation 
-  linker errors while keeping asynchronous background serial communications.
+  STAP ESP32 Controller — Firmware v18.5 (Serial Buffer Drain Optimization)
+  =====================================================================
+  Completely removes the serial loop break statement to process the RX 
+  buffer instantly, eliminating communication lag and artificial watchdog triggers.
 */
 
 #include <Wire.h>
