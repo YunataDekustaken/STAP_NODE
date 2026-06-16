@@ -1,9 +1,9 @@
 """
 STAP: Smart Traffic Automation Program
 =======================================
-v18.5 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
-        with Dedicated Asynchronous Watchdog Thread Timer Decoupled Natively 
-        from Main Loop Process Latencies to Eliminate All System Flickering.
+v17.0 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
+        with On-Screen Signal HUD Driven Strictly by ESP32 Serial Handshakes,
+        Big Approach Labels, and Real-Time Spatial Occupancy Tracking.
 """
 
 from ultralytics import YOLO
@@ -430,6 +430,7 @@ rain_detected   = False
 manual_override = False
 last_comm_time  = time.time()
 
+# --- HIGH-FIDELITY SERIAL COMMAND PARSING CHANNELS ---
 def read_serial_incoming():
     global rain_detected, manual_override, last_comm_time
     if ser:
@@ -439,6 +440,7 @@ def read_serial_incoming():
             
             last_comm_time = time.time()
             
+            # 1. Parse environmental feedback conditions
             if "RAIN:" in line and "MODE:" in line:
                 for part in line.split(","):
                     if part.startswith("RAIN:"):
@@ -446,7 +448,9 @@ def read_serial_incoming():
                     elif part.startswith("MODE:"):
                         manual_override = (part.split(":")[1] == "MANUAL")
             
+            # 2. Intercept actual feedback confirmation tokens (e.g. "STATE:NORTH,GREEN")
             elif line.startswith("STATE:"):
+                # Clean prefix away
                 payload = line.replace("STATE:", "")
                 lane, hardware_lamp = payload.split(",")
                 if lane in LANE_NAMES and hardware_lamp in ["RED", "YELLOW", "GREEN"]:
@@ -817,12 +821,6 @@ try:
         display_greens = {lane: compute_green_time(lane, rain_detected) for lane in LANE_NAMES}
         display_greens[snap_lane] = snap_green
 
-        # --- DYNAMIC HAZARD BLINK OVERRIDE FILTER PATTERN CHANNELS ---
-        if all(local_manual_lights.get(l) == "YELLOW" for l in LANE_NAMES):
-            last_hazard_blink_time = now
-            
-        is_hazard_pattern_active = (now - last_hazard_blink_time < 1.5)
-
         drawn = list(imgs)
         for idx, lane in enumerate(LANE_NAMES):
             fr = drawn[idx]
@@ -833,8 +831,8 @@ try:
             cv2.addWeighted(overlay, ROI_ALPHA, fr, 1.0 - ROI_ALPHA, 0, fr)
             cv2.polylines(fr, [ROI_POLYGONS[lane]], isClosed=True, color=lane_color, thickness=2)
 
-            # --- BIG APPROACH IDENTIFIER TEXT HUD LAYER (Refactored Clean Labels) ---
-            label_text = f"{lane}"
+            # --- BIG APPROACH IDENTIFIER TEXT HUD LAYER ---
+            label_text = f"--- {lane} APPROACH ---"
             text_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_DUPLEX, 0.75, 2)[0]
             text_x = (CAM_WIDTH - text_size[0]) // 2
             cv2.putText(fr, label_text, (text_x + 1, 31), cv2.FONT_HERSHEY_DUPLEX, 0.75, (0, 0, 0), 2, cv2.LINE_AA)
@@ -1048,7 +1046,7 @@ try:
 
 finally:
     # =============================================================
-    # 11. CLEANUP EXITS & FINAL ABSOLUTE GRAND TOTALS SUMMARY REPORT
+    # 11. CLEANUP EXITS & FINAL REPORT
     # =============================================================
     print("\n[STAP] 🛑 Shutdown Signal Intercepted. Closing background modules cleanly...")
     
