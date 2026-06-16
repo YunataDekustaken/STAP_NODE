@@ -82,7 +82,7 @@ LOOP_VIDEOS  = True
 CAM_WIDTH    = 640
 CAM_HEIGHT   = 480
 TARGET_FPS   = 30
-DATA_TIMEOUT = 6.0  # Synced to match the 6000ms hardware watchdog window
+DATA_TIMEOUT = 6.0  
 
 # --- AUTOMATED REGION OF INTEREST (ROI) ENGINE ---
 RAW_HIGH_RES_ROIS = {
@@ -131,7 +131,7 @@ MAX_ADJUSTMENT  = 10
 LOS_THRESHOLDS = [("A",0,1),("B",2,3),("C",4,6),("D",7,10),("E",11,15),("F",16,999)]
 LOS_DELTA      = {"A":-10,"B":-6,"C":0,"D":+6,"E":+8,"F":+10}
 
-PING_INTERVAL = 0.4
+PING_INTERVAL = 0.5
 
 CONF_THRESHOLD            = 0.50 
 EMERGENCY_SUSTAIN_SECONDS = 3.0 
@@ -401,7 +401,8 @@ for r in readers: r.start()
 
 print("[STAP] Connecting to ESP32 Hardware Module...")
 try:
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    # Set a robust write timeout rule to prevent execution deadlocks
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1, write_timeout=0.5)
     ser.reset_input_buffer()
     ser.reset_output_buffer()
     print(f"[STAP] ✅ Connected to ESP32 on {SERIAL_PORT}")
@@ -425,6 +426,7 @@ def send_to_esp32(msg: str):
         try:
             with serial_lock: 
                 ser.write(f"{msg}\n".encode("utf-8"))
+                ser.flush()  # Force data past system buffer down into raw wires instantly
         except Exception: pass
 
 def read_serial_incoming():
@@ -705,17 +707,45 @@ def advance_phase():
     green = compute_green_time(next_lane, rain_detected)
     start_green(next_lane, green)
 
+# --- BULLETPROOF SYNCHRONIZATION RUNTIME LOOP ---
 def keepalive_thread():
     hub_tick = 0
     while True:
-        time.sleep(PING_INTERVAL)
-        with phase_lock: 
-            active = PHASE_ORDER[current_phase_idx]
-        send_to_esp32(f"PING:{active}")
-        hub_tick += 1
-        if hub_tick >= HUB_INTERVAL_TICKS:
-            hub_tick = 0
-            post_to_hub()
+        try:
+            # Shifted down to a balanced 1.0s interval since the ESP32 connection lock is active
+            time.sleep(1.0)
+            with phase_lock: 
+                active = PHASE_ORDER[current_phase_idx]
+                state = phase_state
+                duration = committed_green
+                g_start = green_start_time
+                try:
+                    a_red_start = all_red_start_time
+                except NameError:
+                    a_red_start = 0
+
+            now = time.time()
+            
+            if state == "GREEN":
+                remain = max(0, duration - int(now - g_start))
+                send_to_esp32(f"PHASE:{active},DURATION:{remain}")
+            elif state == "ALL_RED":
+                try:
+                    remain = max(0, ALL_RED_TIME - int(now - a_red_start))
+                    send_to_esp32(f"PHASE:ALL_RED,DURATION:{remain}")
+                except NameError:
+                    send_to_esp32(f"PING:{active}")
+            else:
+                send_to_esp32(f"PING:{active}")
+
+            hub_tick += 1
+            if hub_tick >= HUB_INTERVAL_TICKS:
+                hub_tick = 0
+                post_to_hub()
+                
+        except Exception:
+            # Safely handle serial disconnections and restart the runtime sequence
+            time.sleep(1.0)
 
 CSV_PATH = os.path.join(CURRENT_RUN_DIR, "traffic_summary.csv")
 with open(CSV_PATH, mode='w', newline='', encoding='utf-8') as f:

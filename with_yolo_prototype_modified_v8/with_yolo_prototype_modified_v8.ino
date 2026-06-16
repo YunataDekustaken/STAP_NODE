@@ -1,8 +1,8 @@
 /*
-  STAP ESP32 Controller — Firmware v18.5 (Serial Buffer Drain Optimization)
+  STAP ESP32 Controller — Firmware v11.3 (Time-Based Fallback Watchdog)
   =====================================================================
-  Completely removes the serial loop break statement to process the RX 
-  buffer instantly, eliminating communication lag and artificial watchdog triggers.
+  Reverted from connection state locks back to classic time-based 
+  watchdog counters to match the v11.3 architecture parameters.
 */
 
 #include <Wire.h>
@@ -60,6 +60,7 @@ const int    FALLBACK_GREEN[] = {50, 50, 39, 35};
 const String FALLBACK_LANE[]  = {"NORTH", "SOUTH", "EAST", "WEST"};
 const int    FALLBACK_COUNT   = 4;
 
+// Reset watchdog timeout rule back to its old 6000ms threshold variable parameter
 const unsigned long WATCHDOG_THRESHOLD = 6000; 
 
 // =============================================================
@@ -202,6 +203,7 @@ void loop() {
   }
 
   if (currentMode == AUTO) {
+    // Reverted checking routine rule parameter back to the time-based watchdog loop
     if (ms - lastCommMillis >= WATCHDOG_THRESHOLD) {
       if (!isOffline) {
         isOffline           = true;
