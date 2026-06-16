@@ -63,11 +63,6 @@ ROI_COLORS = {
 }
 ROI_ALPHA = 0.15 
 
-# --- CRITICAL FIX: EXPLICIT INITIAL HARDWARE & ENVIRONMENT GLOBAL INITIALIZATIONS ---
-rain_detected   = False
-manual_override = False
-last_comm_time  = time.time()
-
 VIDEO_FILES = [
     r"C:\Users\Raphael\Desktop\YOLO\FINAL\13_North.MOV",
     r"C:\Users\Raphael\Desktop\YOLO\FINAL\13_South.mp4",
@@ -79,7 +74,7 @@ LOOP_VIDEOS  = True
 CAM_WIDTH    = 640
 CAM_HEIGHT   = 480
 TARGET_FPS   = 30
-DATA_TIMEOUT = 6.0  
+DATA_TIMEOUT = 5.0
 
 # --- AUTOMATED REGION OF INTEREST (ROI) ENGINE ---
 RAW_HIGH_RES_ROIS = {
@@ -128,7 +123,7 @@ MAX_ADJUSTMENT  = 10
 LOS_THRESHOLDS = [("A",0,1),("B",2,3),("C",4,6),("D",7,10),("E",11,15),("F",16,999)]
 LOS_DELTA      = {"A":-10,"B":-6,"C":0,"D":+6,"E":+8,"F":+10}
 
-PING_INTERVAL = 0.5
+PING_INTERVAL = 0.4
 
 CONF_THRESHOLD            = 0.50 
 EMERGENCY_SUSTAIN_SECONDS = 3.0 
@@ -166,7 +161,6 @@ else:
 # =============================================================
 frame_lock  = threading.Lock()
 result_lock = threading.Lock()
-serial_lock = threading.Lock() 
 
 lane_stream_locks = {lane: threading.Lock() for lane in LANE_NAMES}
 global_lane_frames = {lane: None for lane in LANE_NAMES}
@@ -177,6 +171,7 @@ vehicle_counts = {lane: 0  for lane in LANE_NAMES}
 lane_statuses  = {lane: "CLEAR" for lane in LANE_NAMES}
 lane_live_occupancy_pct = {lane: 0.0 for lane in LANE_NAMES}
 
+# Master Light States (Populated strictly by data packets streaming back from ESP32)
 manual_lane_lights = {lane: "RED" for lane in LANE_NAMES}
 
 analytics_lock = threading.Lock()
@@ -398,12 +393,16 @@ for r in readers: r.start()
 
 print("[STAP] Connecting to ESP32 Hardware Module...")
 try:
-    # Set a robust write timeout rule to prevent execution deadlocks
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1, write_timeout=0.5)
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
     ser.reset_input_buffer()
     ser.reset_output_buffer()
     print(f"[STAP] ✅ Connected to ESP32 on {SERIAL_PORT}")
     time.sleep(1)
+    print("[STAP] Sending boot keepalives while YOLO loads...")
+    for _ in range(15):
+        ser.write(b"PING:NORTH\n")
+        ser.flush()
+        time.sleep(0.3)
 except Exception as e:
     print(f"[STAP] ❌ Serial connection failed ({e}). Running in Offline-simulation mode.")
     ser = None
@@ -421,9 +420,8 @@ time.sleep(2.0)
 def send_to_esp32(msg: str):
     if ser and ser.is_open:
         try:
-            with serial_lock: 
-                ser.write(f"{msg}\n".encode("utf-8"))
-                ser.flush()  # Force data past system buffer down into raw wires instantly
+            ser.write(f"{msg}\n".encode("utf-8"))
+            ser.flush()
         except Exception: pass
 
 rain_detected   = False
@@ -433,7 +431,7 @@ last_comm_time  = time.time()
 # --- HIGH-FIDELITY SERIAL COMMAND PARSING CHANNELS ---
 def read_serial_incoming():
     global rain_detected, manual_override, last_comm_time
-    if ser:
+    if ser and ser.in_waiting:
         try:
             line = ser.readline().decode("utf-8", errors="ignore").strip()
             if not line: return
@@ -680,6 +678,7 @@ def start_yellow(lane: str):
         phase_state       = "YELLOW"
         yellow_start_time = time.time()
     send_to_esp32(f"YELLOW:{lane}")
+    send_to_esp32(f"DISPLAY:YELLOW,{YELLOW_TIME}")
 
 def start_all_red():
     global phase_state, all_red_start_time
@@ -687,6 +686,7 @@ def start_all_red():
         phase_state        = "ALL_RED"
         all_red_start_time = time.time()
     send_to_esp32("PHASE:ALL_RED,DURATION:2")
+    send_to_esp32("DISPLAY:OFF")
     print("[STAP] 🚨 All-Red clearance safety interval initialized intersection-wide.")
 
 def start_green(next_lane: str, duration: int):
@@ -699,6 +699,7 @@ def start_green(next_lane: str, duration: int):
         all_red_start_time = 0.0
         committed_green    = duration
     send_to_esp32(f"PHASE:{next_lane},DURATION:{duration}")
+    send_to_esp32("DISPLAY:OFF")
 
 def advance_phase():
     global current_phase_idx
@@ -711,45 +712,16 @@ def advance_phase():
     green = compute_green_time(next_lane, rain_detected)
     start_green(next_lane, green)
 
-# --- BULLETPROOF SYNCHRONIZATION RUNTIME LOOP ---
 def keepalive_thread():
     hub_tick = 0
     while True:
-        try:
-            # Shifted down to a balanced 1.0s interval since the ESP32 connection lock is active
-            time.sleep(1.0)
-            with phase_lock: 
-                active = PHASE_ORDER[current_phase_idx]
-                state = phase_state
-                duration = committed_green
-                g_start = green_start_time
-                try:
-                    a_red_start = all_red_start_time
-                except NameError:
-                    a_red_start = 0
-
-            now = time.time()
-            
-            if state == "GREEN":
-                remain = max(0, duration - int(now - g_start))
-                send_to_esp32(f"PHASE:{active},DURATION:{remain}")
-            elif state == "ALL_RED":
-                try:
-                    remain = max(0, ALL_RED_TIME - int(now - a_red_start))
-                    send_to_esp32(f"PHASE:ALL_RED,DURATION:{remain}")
-                except NameError:
-                    send_to_esp32(f"PING:{active}")
-            else:
-                send_to_esp32(f"PING:{active}")
-
-            hub_tick += 1
-            if hub_tick >= HUB_INTERVAL_TICKS:
-                hub_tick = 0
-                post_to_hub()
-                
-        except Exception:
-            # Safely handle serial disconnections and restart the runtime sequence
-            time.sleep(1.0)
+        time.sleep(PING_INTERVAL)
+        with phase_lock: active = PHASE_ORDER[current_phase_idx]
+        send_to_esp32(f"PING:{active}")
+        hub_tick += 1
+        if hub_tick >= HUB_INTERVAL_TICKS:
+            hub_tick = 0
+            post_to_hub()
 
 CSV_PATH = os.path.join(CURRENT_RUN_DIR, "traffic_summary.csv")
 with open(CSV_PATH, mode='w', newline='', encoding='utf-8') as f:
@@ -758,7 +730,6 @@ with open(CSV_PATH, mode='w', newline='', encoding='utf-8') as f:
     writer.writerow(["Session Start Initialization Time", datetime.now().strftime("%Y-%m-%d %H:%M:%S")])
     writer.writerow([])
 
-# Boot up threads safely
 threading.Thread(target=keepalive_thread, daemon=True).start()
 threading.Thread(target=hub_heartbeat_thread, daemon=True).start()
 threading.Thread(target=run_flask_server, daemon=True).start() 
@@ -838,6 +809,7 @@ try:
             cv2.putText(fr, label_text, (text_x + 1, 31), cv2.FONT_HERSHEY_DUPLEX, 0.75, (0, 0, 0), 2, cv2.LINE_AA)
             cv2.putText(fr, label_text, (text_x, 30), cv2.FONT_HERSHEY_DUPLEX, 0.75, lane_color, 2, cv2.LINE_AA)
 
+            # --- ENGINE ARCHITECTURE FOR HUD TRAFFIC LIGHT DRAWING PASS ---
             tl_x, tl_y = 580, 15
             br_x, br_y = 625, 140
             cv2.rectangle(fr, (tl_x, tl_y), (br_x, br_y), (35, 35, 35), -1)   
@@ -992,6 +964,9 @@ try:
 
         cv2.imshow("STAP Analytics Dashboard", dashboard_img)
 
+        # =============================================================
+        # 10c. AUTOMATED RUN PERIODIC LEDGER EXPORT
+        # =============================================================
         if now - last_csv_log_time >= CSV_LOG_INTERVAL:
             last_csv_log_time = now
             print(f"[STAP] 🕒 Log Interval Triggered. Appending active density metrics data to ledger...")
@@ -1055,7 +1030,7 @@ finally:
     video_writer.release()
     cv2.destroyAllWindows()
     
-    print(f"[STAP] 📊 Compiling master dataset summary sheet ledger -> {CSV_PATH}")
+    print(f"[STAP] 📊 Compiling absolute density data frames into master sheet ledger -> {CSV_PATH}")
     
     with analytics_lock:
         all_detected_classes = sorted(list(known_classes_seen))

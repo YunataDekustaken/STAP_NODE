@@ -1,8 +1,8 @@
 /*
-  STAP ESP32 Controller — Firmware v11.3 (Time-Based Fallback Watchdog)
+  STAP ESP32 Controller — Firmware v17.5 (Synchronized Feedback Engine)
   =====================================================================
-  Reverted from connection state locks back to classic time-based 
-  watchdog counters to match the v11.3 architecture parameters.
+  Natively broadcasts absolute hardware light states back across the 
+  serial channel during Manual Mode triggers to synchronize virtual HUDs.
 */
 
 #include <Wire.h>
@@ -26,6 +26,7 @@ const int ledEast   = 26; const int ledNorth  = 27;
 const int latchPin = 5;  const int clockPin = 18;
 const int dataPin  = 19; const int oePin    = 4;
 
+// Per-lane timer display I2C addresses
 #define ADDR_NORTH   0x70
 #define ADDR_SOUTH   0x72
 #define ADDR_EAST    0x74
@@ -44,6 +45,7 @@ const int RAIN_THRESHOLD = 3000;
 // =============================================================
 LiquidCrystal_I2C lcd(0x27, 20, 4);
 
+// Per-lane countdown displays
 Adafruit_7segment timerNorth = Adafruit_7segment();
 Adafruit_7segment timerSouth = Adafruit_7segment();
 Adafruit_7segment timerEast  = Adafruit_7segment();
@@ -60,8 +62,7 @@ const int    FALLBACK_GREEN[] = {50, 50, 39, 35};
 const String FALLBACK_LANE[]  = {"NORTH", "SOUTH", "EAST", "WEST"};
 const int    FALLBACK_COUNT   = 4;
 
-// Reset watchdog timeout rule back to its old 6000ms threshold variable parameter
-const unsigned long WATCHDOG_THRESHOLD = 6000; 
+const unsigned long DATA_TIMEOUT = 30000;
 
 // =============================================================
 // 4. STATE VARIABLES
@@ -69,26 +70,28 @@ const unsigned long WATCHDOG_THRESHOLD = 6000;
 enum Mode { AUTO, MANUAL };
 Mode currentMode = AUTO;
 
+// ── Auto online signal state ──────────────────────────────────
 enum OnlineSignal { SIG_GREEN, SIG_YELLOW, SIG_WAITING };
 OnlineSignal  onlineSignal      = SIG_WAITING;
 String        activeLane        = "NORTH";
 int           greenCountdown    = 0;
 unsigned long yellowStartMillis = 0;
 
-// Watchdog tracking variables
-unsigned long lastCommMillis       = 0; 
-bool          isOffline            = false;
-int           fallbackIdx          = 0;
-int           fallbackCountdown    = 50;
-bool          fallbackInYellow     = false;
-unsigned long fallbackYellowStart  = 0;
+// ── Offline fallback state ────────────────────────────────────
+unsigned long lastCommMillis      = 0;
+unsigned long silenceStartMillis  = 0;
+bool          isOffline           = false;
+int           fallbackIdx         = 0;
+int           fallbackCountdown   = 50;
+bool          fallbackInYellow    = false;
+unsigned long fallbackYellowStart = 0;
 
-unsigned long lastTickMillis       = 0;
-unsigned long lastTelemetryTime    = 0;
-bool          rainDetected         = false;
+// ── Shared ────────────────────────────────────────────────────
+unsigned long lastTickMillis    = 0;
+unsigned long lastTelemetryTime = 0;
+bool          rainDetected      = false;
 
-// Memory verification caches to eliminate duplicate I2C traffic loads
-int lastN = -2, lastS = -2, lastE = -2, lastW = -2;
+// ── LCD cache boundaries (Deduplication system) ───────────────
 String lastLine1 = "", lastLine2 = "", lastLine3 = "", lastLine4 = "";
 
 // =============================================================
@@ -116,13 +119,13 @@ void setYellow(String lane);
 void setTransitionLights(ManualState prev);
 void blinkYellows();
 void showCentered(Adafruit_7segment &disp, int number);
-void updateTimers(int n, int s, int e, int w, bool forceClear);
+void updateTimers(int n, int s, int e, int w);
 void updateLCD(String l1, String l2, String l3, String l4);
 bool checkButtonPress(int pin);
 void parsePythonCommand(String msg);
-void runAutoOnline(unsigned long ms, bool forceUpdate);
-void runAutoFallback(unsigned long ms, bool forceUpdate);
-void handleManual(unsigned long ms, bool forceUpdate);
+void runAutoOnline(unsigned long ms);
+void runAutoFallback(unsigned long ms);
+void handleManual(unsigned long ms);
 void broadcastManualStates();
 
 // =============================================================
@@ -144,7 +147,7 @@ void setup() {
   timerWest.begin(ADDR_WEST);   timerWest.setBrightness(10);
 
   lcd.init(); lcd.backlight();
-  updateLCD("====================", " STAP SYSTEM READY  ", "   WATCHDOG ACTIVE  ", "====================");
+  updateLCD("====================", " ESP32 TRAFFIC CTRL ", "   SYSTEM BOOTING   ", "====================");
 
   pinMode(rainSensorPin,  INPUT);
   pinMode(btnAuto,        INPUT_PULLUP); pinMode(btnManual,    INPUT_PULLUP);
@@ -153,7 +156,7 @@ void setup() {
   pinMode(btnGoSouth,     INPUT_PULLUP); pinMode(btnGoWest,    INPUT_PULLUP);
 
   setAllRed();
-  lastCommMillis = millis(); 
+  lastCommMillis = millis();
   delay(1000);
   digitalWrite(oePin, LOW);
 }
@@ -167,10 +170,15 @@ void loop() {
 
   if (ms - lastTelemetryTime >= 400) {
     lastTelemetryTime = ms;
-    Serial.println("RAIN:" + String(rainDetected ? "1" : "0") + ",MODE:" + String(currentMode == MANUAL ? "MANUAL" : "AUTO"));
+    Serial.println(
+      "RAIN:" + String(rainDetected ? "1" : "0") +
+      ",MODE:" + String(currentMode == MANUAL ? "MANUAL" : "AUTO")
+    );
+    // Explicitly pulse manual lamp verification updates back down stream channels
     if (currentMode == MANUAL) {
       broadcastManualStates();
     }
+    Serial.flush();
   }
 
   static String buf = "";
@@ -180,6 +188,8 @@ void loop() {
       buf.trim();
       if (buf.length() > 0) {
         parsePythonCommand(buf);
+        buf = "";
+        break;
       }
       buf = "";
     } else if (c != '\r') {
@@ -188,40 +198,39 @@ void loop() {
   }
 
   if (checkButtonPress(btnAuto)) {
-    currentMode    = AUTO;
-    lastCommMillis = ms; 
-    isOffline      = false;
+    currentMode        = AUTO;
+    lastCommMillis     = ms;
+    isOffline          = false;
+    silenceStartMillis = 0;
     updateShiftRegister();
-    updateTimers(-1, -1, -1, -1, true); 
   } else if (checkButtonPress(btnManual)) {
     currentMode  = MANUAL;
     manualState  = MAN_STOPPED;
     manualTarget = MAN_STOPPED;
     setAllRed();
     broadcastManualStates();
-    updateTimers(-1, -1, -1, -1, true);
   }
 
   if (currentMode == AUTO) {
-    // Reverted checking routine rule parameter back to the time-based watchdog loop
-    if (ms - lastCommMillis >= WATCHDOG_THRESHOLD) {
-      if (!isOffline) {
-        isOffline           = true;
-        fallbackIdx         = 0;
-        fallbackCountdown   = FALLBACK_GREEN[0];
-        fallbackInYellow    = false;
-        fallbackYellowStart = 0;
-        onlineSignal        = SIG_WAITING;
-        Serial.println("ALERT:WATCHDOG_TRIPPED_FALLBACK_ENGAGED");
-        updateTimers(-1, -1, -1, -1, true); 
+    bool nowSilent = (ms - lastCommMillis > 1000);
+    if (!nowSilent) {
+      silenceStartMillis = 0;
+      isOffline          = false;
+    } else {
+      if (silenceStartMillis == 0) silenceStartMillis = ms;
+      if (!isOffline && (ms - silenceStartMillis >= DATA_TIMEOUT)) {
+        isOffline            = true;
+        fallbackIdx          = 0;
+        fallbackCountdown    = FALLBACK_GREEN[0];
+        fallbackInYellow     = false;
+        fallbackYellowStart  = 0;
+        onlineSignal         = SIG_WAITING;
       }
     }
   }
 
-  bool executeDisplayTick = false;
   if (ms - lastTickMillis >= 1000) {
     lastTickMillis = ms;
-    executeDisplayTick = true; 
     if (currentMode == AUTO) {
       if (!isOffline && onlineSignal == SIG_GREEN && greenCountdown > 0)
         greenCountdown--;
@@ -232,29 +241,30 @@ void loop() {
 
   switch (currentMode) {
     case AUTO:
-      if (!isOffline) runAutoOnline(ms, executeDisplayTick);
-      else            runAutoFallback(ms, executeDisplayTick);
+      if (!isOffline) runAutoOnline(ms);
+      else            runAutoFallback(ms);
       break;
     case MANUAL:
-      handleManual(ms, executeDisplayTick);
+      handleManual(ms);
       break;
   }
 }
 
 // =============================================================
-// 9. PYTHON COMMAND PARSER
+// 9. PYTHON COMMAND PARSER (With Verification Streaming Echoes)
 // =============================================================
 void parsePythonCommand(String msg) {
   if (msg.startsWith("PHASE:")   ||
       msg.startsWith("YELLOW:")  ||
       msg.startsWith("PING:")    ||
+      msg.startsWith("DISPLAY:") ||
       msg.startsWith("MODE:")    ||
       msg.startsWith("MANUAL_LIGHT:") ||
       msg.startsWith("HAZARD:")  ||
       msg.startsWith("EMERGENCY_OVERRIDE:")) {
-      
-    lastCommMillis = millis();
-    isOffline      = false;
+    lastCommMillis     = millis();
+    silenceStartMillis = 0;
+    isOffline          = false;
   } else {
     return;
   }
@@ -306,29 +316,43 @@ void parsePythonCommand(String msg) {
 
     String lane  = payload.substring(0, commaIdx);
     String state = payload.substring(commaIdx + 1);
-    lane.trim(); state.trim();
+    lane.trim();
+    state.trim();
 
     if      (lane == "NORTH" && state == "GREEN")  { manualState = MAN_N_GO; setNorthGo(); }
     else if (lane == "SOUTH" && state == "GREEN")  { manualState = MAN_S_GO; setSouthGo(); }
     else if (lane == "EAST"  && state == "GREEN")  { manualState = MAN_E_GO; setEastGo();  }
     else if (lane == "WEST"  && state == "GREEN")  { manualState = MAN_W_GO; setWestGo();  }
-    else if (state == "RED") { manualState = MAN_STOPPED; setAllRed(); }
-    else if (state == "YELLOW") { setYellow(lane); }
+    else if (state == "RED") {
+      manualState = MAN_STOPPED;
+      setAllRed();
+    }
+    else if (state == "YELLOW") {
+      setYellow(lane);
+    }
 
-    updateTimers(-1, -1, -1, -1, true);
-    broadcastManualStates(); 
+    updateTimers(-1, -1, -1, -1);
+    broadcastManualStates(); // Send absolute verification echoes back instantly
     return;
   }
 
   if (msg.startsWith("EMERGENCY_OVERRIDE:")) {
     String lane = msg.substring(19);
     lane.trim();
+
     currentMode        = AUTO;
     manualHazardActive = false;
-    onlineSignal       = SIG_YELLOW;
-    yellowStartMillis  = millis();
+    isOffline          = false;
+
+    onlineSignal      = SIG_YELLOW;
+    yellowStartMillis = millis();
     setYellow(activeLane);
+
     activeLane = lane;
+    return;
+  }
+
+  if (msg.startsWith("DISPLAY:")) {
     return;
   }
 
@@ -370,48 +394,60 @@ void parsePythonCommand(String msg) {
 // =============================================================
 // 10. AUTO ONLINE MODE
 // =============================================================
-void runAutoOnline(unsigned long ms, bool forceUpdate) {
+void runAutoOnline(unsigned long ms) {
+  switch (onlineSignal) {
+    case SIG_GREEN:
+      if      (activeLane == "NORTH") { setNorthGo(); updateTimers(greenCountdown, -1, -1, -1); }
+      else if (activeLane == "SOUTH") { setSouthGo(); updateTimers(-1, greenCountdown, -1, -1); }
+      else if (activeLane == "EAST")  { setEastGo();  updateTimers(-1, -1, greenCountdown, -1); }
+      else if (activeLane == "WEST")  { setWestGo();  updateTimers(-1, -1, -1, greenCountdown); }
+      break;
+
+    case SIG_YELLOW: {
+      setYellow(activeLane);
+      unsigned long elapsed = ms - yellowStartMillis;
+      int yRemain = max(0, YELLOW_TIME - (int)(elapsed / 1000));
+      if      (activeLane == "NORTH") updateTimers(yRemain, -1, -1, -1);
+      else if (activeLane == "SOUTH") updateTimers(-1, yRemain, -1, -1);
+      else if (activeLane == "EAST")  updateTimers(-1, -1, yRemain, -1);
+      else if (activeLane == "WEST")  updateTimers(-1, -1, -1, yRemain);
+
+      if (elapsed >= (unsigned long)(YELLOW_TIME * 1000)) {
+        onlineSignal = SIG_WAITING;
+      }
+      break;
+    }
+
+    case SIG_WAITING:
+      setAllRed();
+      updateTimers(-1, -1, -1, -1);
+      break;
+  }
+
+  String title  = rainDetected ? "-- AUTO (+RAIN) --" : "-- AUTO (SMART AI) --";
+  String sigStr;
+  int    disp   = 0;
+
   if (onlineSignal == SIG_GREEN) {
-    if      (activeLane == "NORTH") setNorthGo();
-    else if (activeLane == "SOUTH") setSouthGo();
-    else if (activeLane == "EAST")  setEastGo();
-    else if (activeLane == "WEST")  setWestGo();
+    sigStr = "GREEN";
+    disp   = greenCountdown;
   } else if (onlineSignal == SIG_YELLOW) {
-    setYellow(activeLane);
-    if (ms - yellowStartMillis >= (unsigned long)(YELLOW_TIME * 1000)) {
-      onlineSignal = SIG_WAITING;
-    }
+    sigStr = "YELLOW";
+    disp   = max(0, YELLOW_TIME - (int)((ms - yellowStartMillis) / 1000));
   } else {
-    setAllRed();
+    sigStr = "--- ALL RED ---";
   }
 
-  if (forceUpdate) {
-    int disp = 0;
-    if (onlineSignal == SIG_GREEN) disp = greenCountdown;
-    else if (onlineSignal == SIG_YELLOW) disp = max(0, YELLOW_TIME - (int)((ms - yellowStartMillis) / 1000));
-
-    if (onlineSignal == SIG_GREEN || onlineSignal == SIG_YELLOW) {
-      if      (activeLane == "NORTH") updateTimers(disp, -1, -1, -1, false);
-      else if (activeLane == "SOUTH") updateTimers(-1, disp, -1, -1, false);
-      else if (activeLane == "EAST")  updateTimers(-1, -1, disp, -1, false);
-      else if (activeLane == "WEST")  updateTimers(-1, -1, -1, disp, false);
-    } else {
-      updateTimers(-1, -1, -1, -1, false);
-    }
-
-    String title  = rainDetected ? "- AUTO (RAIN MODE) -" : "- AUTO (SMART AI)  -";
-    String sigStr = (onlineSignal == SIG_GREEN) ? "GREEN" : ((onlineSignal == SIG_YELLOW) ? "YELLOW" : "ALL RED");
-    String l2_text = "ACTIVE LANE: " + activeLane;
-    String l3_text = "SIGNAL: " + sigStr;
-    String l4_text = "COUNTDOWN: " + String(disp) + "s";
-    updateLCD(title, l2_text, l3_text, l4_text);
-  }
+  String cntLine = (onlineSignal == SIG_WAITING)
+    ? "Switching lane..."
+    : "Countdown: " + String(disp) + "s";
+  updateLCD(title, "ACTIVE: " + activeLane, "SIGNAL: " + sigStr, cntLine);
 }
 
 // =============================================================
 // 11. AUTO FALLBACK MODE
 // =============================================================
-void runAutoFallback(unsigned long ms, bool forceUpdate) {
+void runAutoFallback(unsigned long ms) {
   if (fallbackInYellow) {
     unsigned long elapsed = ms - fallbackYellowStart;
     if (elapsed >= (unsigned long)(YELLOW_TIME * 1000)) {
@@ -436,40 +472,41 @@ void runAutoFallback(unsigned long ms, bool forceUpdate) {
     else if (fbLane == "WEST")  setWestGo();
   }
 
-  if (forceUpdate) {
-    int currentRemaining = fallbackInYellow ? max(0, YELLOW_TIME - (int)((ms - fallbackYellowStart) / 1000)) : fallbackCountdown;
+  int currentRemaining = fallbackInYellow
+    ? max(0, YELLOW_TIME - (int)((ms - fallbackYellowStart) / 1000))
+    : fallbackCountdown;
 
-    int timers[4];
-    for (int i = 0; i < 4; i++) {
-      if (fallbackIdx == i) {
-        timers[i] = currentRemaining; 
-      } else {
-        int totalWait = currentRemaining;
-        if (!fallbackInYellow) totalWait += YELLOW_TIME; 
-        
-        int checkIdx = (fallbackIdx + 1) % 4;
-        while (checkIdx != i) {
-          totalWait += FALLBACK_GREEN[checkIdx] + YELLOW_TIME;
-          checkIdx = (checkIdx + 1) % 4;
-        }
-        timers[i] = totalWait; 
+  int timers[4];
+  for (int i = 0; i < 4; i++) {
+    if (fallbackIdx == i) {
+      timers[i] = currentRemaining; 
+    } else {
+      int totalWait = currentRemaining;
+      if (!fallbackInYellow) {
+        totalWait += YELLOW_TIME; 
       }
+      
+      int checkIdx = (fallbackIdx + 1) % 4;
+      while (checkIdx != i) {
+        totalWait += FALLBACK_GREEN[checkIdx] + YELLOW_TIME;
+        checkIdx = (checkIdx + 1) % 4;
+      }
+      timers[i] = totalWait; 
     }
-
-    updateTimers(timers[0], timers[1], timers[2], timers[3], false);
-    String sig = fallbackInYellow ? "YELLOW" : "GREEN";
-    
-    updateLCD("[ALARM] OFFLINE MODE", 
-              "COMMUNICATION LOSS", 
-              "LANE: " + fbLane + " [" + sig + "]", 
-              "COUNTDOWN: " + String(currentRemaining) + "s");
   }
+
+  updateTimers(timers[0], timers[1], timers[2], timers[3]);
+
+  String sig  = fallbackInYellow ? "YELLOW" : "GREEN";
+  updateLCD("-- AUTO FALLBACK --", "NETWORK LOSS",
+            "Active: " + fbLane + " [" + sig + "]",
+            "Countdown: " + String(currentRemaining) + "s");
 }
 
 // =============================================================
 // 12. MANUAL OVERRIDE
 // =============================================================
-void handleManual(unsigned long ms, bool forceUpdate) {
+void handleManual(unsigned long ms) {
   if (checkButtonPress(btnEmergency)) {
     if (manualState == MAN_EMERGENCY) {
       manualState = MAN_STOPPED; manualTarget = MAN_STOPPED;
@@ -479,13 +516,10 @@ void handleManual(unsigned long ms, bool forceUpdate) {
       manualHazardActive = false; updateShiftRegister();
     }
     broadcastManualStates();
-    updateTimers(-1, -1, -1, -1, true);
   }
   if (manualState == MAN_EMERGENCY) {
-    if (forceUpdate) {
-      updateLCD("[EMERGENCY OVERRIDE]", "INTERSECTION LOCKED", "ALL APPROACHES: RED", "PRESS EMG TO CLEAR ");
-    }
-    setAllRed(); 
+    setAllRed(); updateTimers(-1, -1, -1, -1);
+    updateLCD("!!! OVERRIDE !!!", "EMERGENCY LOCKDOWN", "All Lanes: RED", "Press EMG to clear");
     return;
   }
 
@@ -494,15 +528,12 @@ void handleManual(unsigned long ms, bool forceUpdate) {
     if (manualHazardActive) { manualState = MAN_STOPPED; manualTarget = MAN_STOPPED; }
     updateShiftRegister();
     broadcastManualStates();
-    updateTimers(-1, -1, -1, -1, true);
   }
   if (manualHazardActive) {
     if ((ms / 500) % 2 == 0) blinkYellows();
     else { lightState &= 0xFFFF0000; updateShiftRegister(); }
-    
-    if (forceUpdate) {
-      updateLCD("- MANUAL OVERRIDE - ", "STATUS: HAZARD ZONE ", "FLASHING YELLOW LENS", "YIELD ALL APPROACHES");
-    }
+    updateTimers(-1, -1, -1, -1);
+    updateLCD("--- MANUAL MODE ---", ">> STATUS: HAZARD", "Flashing Yellows", "Yield all traffic");
     return;
   }
 
@@ -511,62 +542,78 @@ void handleManual(unsigned long ms, bool forceUpdate) {
     else if (checkButtonPress(btnGoSouth) && manualState != MAN_S_GO) { prevManualState = manualState; manualTarget = MAN_S_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; }
     else if (checkButtonPress(btnGoEast)  && manualState != MAN_E_GO) { prevManualState = manualState; manualTarget = MAN_E_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; }
     else if (checkButtonPress(btnGoWest)  && manualState != MAN_W_GO) { prevManualState = manualState; manualTarget = MAN_W_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; }
-    if (manualState == MAN_TRANSITION) {
-      broadcastManualStates();
-      updateTimers(-1, -1, -1, -1, true);
-    }
+    if (manualState == MAN_TRANSITION) broadcastManualStates();
   }
 
   if (manualState == MAN_TRANSITION) {
     setTransitionLights(prevManualState); updateShiftRegister();
     long elapsed   = ms - manualTransitionStart;
     int  remaining = max(0, YELLOW_TIME - (int)(elapsed / 1000));
-    
-    if (forceUpdate) {
-      if      (prevManualState == MAN_N_GO) updateTimers(remaining, -1, -1, -1, false);
-      else if (prevManualState == MAN_S_GO) updateTimers(-1, remaining, -1, -1, false);
-      else if (prevManualState == MAN_E_GO) updateTimers(-1, -1, remaining, -1, false);
-      else if (prevManualState == MAN_W_GO) updateTimers(-1, -1, -1, remaining, false);
-      updateLCD("- MANUAL OVERRIDE - ", "SWITCHING CHANNELS  ", "CLEARANCE: " + String(remaining) + "s   ", "CHANGING SIGNAL HEAD");
-    }
+    if      (prevManualState == MAN_N_GO) updateTimers(remaining, -1, -1, -1);
+    else if (prevManualState == MAN_S_GO) updateTimers(-1, remaining, -1, -1);
+    else if (prevManualState == MAN_E_GO) updateTimers(-1, -1, remaining, -1);
+    else if (prevManualState == MAN_W_GO) updateTimers(-1, -1, -1, remaining);
+    else                                  updateTimers(-1, -1, -1, -1);
+    updateLCD("--- MANUAL MODE ---", ">> SWITCHING LANES", "Wait: " + String(remaining) + "s", "Changing active lane");
     if (elapsed >= (long)(YELLOW_TIME * 1000)) { 
       manualState = manualTarget; 
       broadcastManualStates();
-      updateTimers(-1, -1, -1, -1, true);
     }
     return;
   }
 
-  if (forceUpdate) {
-    if      (manualState == MAN_N_GO) { updateLCD("- MANUAL OVERRIDE - ", "ACTIVE FLOW: NORTH  ", "MANUAL ROUTING REQ  ", "SELECT NEXT APPROACH"); }
-    else if (manualState == MAN_S_GO) { updateLCD("- MANUAL OVERRIDE - ", "ACTIVE FLOW: SOUTH  ", "MANUAL ROUTING REQ  ", "SELECT NEXT APPROACH"); }
-    else if (manualState == MAN_E_GO) { updateLCD("- MANUAL OVERRIDE - ", "ACTIVE FLOW: EAST   ", "MANUAL ROUTING REQ  ", "SELECT NEXT APPROACH"); }
-    else if (manualState == MAN_W_GO) { updateLCD("- MANUAL OVERRIDE - ", "ACTIVE FLOW: WEST   ", "MANUAL ROUTING REQ  ", "SELECT NEXT APPROACH"); }
-    else                              { updateLCD("- MANUAL OVERRIDE - ", "REMOTE WORKSTATION  ", "ALL APPROACHES: RED ", "AWAITING SERIAL REQ "); }
-  }
-
-  if      (manualState == MAN_N_GO) setNorthGo();
-  else if (manualState == MAN_S_GO) setSouthGo();
-  else if (manualState == MAN_E_GO) setEastGo();
-  else if (manualState == MAN_W_GO) setWestGo();
-  else                              setAllRed();
+  if      (manualState == MAN_N_GO) { setNorthGo(); updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: NORTH", "Manual override act.", "Select next lane ->"); }
+  else if (manualState == MAN_S_GO) { setSouthGo(); updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: SOUTH", "Manual override act.", "Select next lane ->"); }
+  else if (manualState == MAN_E_GO) { setEastGo();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: EAST",  "Manual override act.", "Select next lane ->"); }
+  else if (manualState == MAN_W_GO) { setWestGo();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: WEST",  "Manual override act.", "Select next lane ->"); }
+  else                              { setAllRed();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> REMOTE CONTROL", "All lanes RED", "Awaiting command..."); }
 }
 
 // =============================================================
-// 13. OUTPUT PRESETS
+// 12b. EXPLICIT HARDWARE LIGHT STATE BROADCASTER
 // =============================================================
+void broadcastManualStates() {
+  // Evaluates exactly which shift register bits are active and prints the matching status
+  String lanes[] = {"NORTH", "SOUTH", "EAST", "WEST"};
+  int greens[]   = {N_GREEN, S_GREEN, E_GREEN, W_GREEN};
+  int yellows[]  = {N_YELLOW, S_YELLOW, E_YELLOW, W_YELLOW};
+  
+  for (int i = 0; i < 4; i++) {
+    String currentLamp = "RED";
+    if (bitRead(lightState, greens[i]))       currentLamp = "GREEN";
+    else if (bitRead(lightState, yellows[i])) currentLamp = "YELLOW";
+    
+    Serial.println("STATE:" + lanes[i] + "," + currentLamp);
+  }
+  Serial.flush();
+}
+
+// =============================================================
+// 13. SHIFT REGISTER & LIGHT PRESETS
+// =============================================================
+void syncIndicatorLEDs() {
+  lightState &= 0x0000FFFF;
+  if (currentMode == AUTO) {
+    bitSet(lightState, ledBlue);
+  } else {
+    bitSet(lightState, ledWhite);
+    if      (manualState == MAN_EMERGENCY)                    bitSet(lightState, ledRed);
+    else if (manualHazardActive)                               bitSet(lightState, ledYellow);
+    else {
+      if (manualState == MAN_N_GO || manualTarget == MAN_N_GO) bitSet(lightState, ledNorth);
+      if (manualState == MAN_S_GO || manualTarget == MAN_S_GO) bitSet(lightState, ledSouth);
+      if (manualState == MAN_E_GO || manualTarget == MAN_E_GO) bitSet(lightState, ledEast);
+      if (manualState == MAN_W_GO || manualTarget == MAN_W_GO) bitSet(lightState, ledWest);
+    }
+  }
+}
+
 void updateShiftRegister() {
   syncIndicatorLEDs();
   digitalWrite(latchPin, LOW);
   for (int i = 3; i >= 0; i--) shiftOut(dataPin, clockPin, MSBFIRST, (lightState >> (i * 8)) & 0xFF);
   digitalWrite(latchPin, HIGH);
 }
-
-void setAllRed()  { lightState &= 0xFFFF0000; bitSet(lightState,N_RED);   bitSet(lightState,S_RED);   bitSet(lightState,E_RED);   bitSet(lightState,W_RED);   updateShiftRegister(); }
-void setNorthGo() { lightState &= 0xFFFF0000; bitSet(lightState,N_GREEN); bitSet(lightState,S_RED);   bitSet(lightState,E_RED);   bitSet(lightState,W_RED);   updateShiftRegister(); }
-void setSouthGo() { lightState &= 0xFFFF0000; bitSet(lightState,N_RED);   bitSet(lightState,S_GREEN); bitSet(lightState,E_RED);   bitSet(lightState,W_RED);   updateShiftRegister(); }
-void setEastGo()  { lightState &= 0xFFFF0000; bitSet(lightState,N_RED);   bitSet(lightState,S_RED);   bitSet(lightState,E_GREEN); bitSet(lightState,W_RED);   updateShiftRegister(); }
-void setWestGo()  { lightState &= 0xFFFF0000; bitSet(lightState,N_RED);   bitSet(lightState,S_RED);   bitSet(lightState,E_RED);   bitSet(lightState,W_GREEN); updateShiftRegister(); }
 
 void setYellow(String lane) {
   lightState &= 0xFFFF0000;
@@ -584,6 +631,12 @@ void blinkYellows() {
   updateShiftRegister();
 }
 
+void setAllRed()  { lightState &= 0xFFFF0000; bitSet(lightState,N_RED);   bitSet(lightState,S_RED);   bitSet(lightState,E_RED);   bitSet(lightState,W_RED);   updateShiftRegister(); }
+void setNorthGo() { lightState &= 0xFFFF0000; bitSet(lightState,N_GREEN); bitSet(lightState,S_RED);   bitSet(lightState,E_RED);   bitSet(lightState,W_RED);   updateShiftRegister(); }
+void setSouthGo() { lightState &= 0xFFFF0000; bitSet(lightState,N_RED);   bitSet(lightState,S_GREEN); bitSet(lightState,E_RED);   bitSet(lightState,W_RED);   updateShiftRegister(); }
+void setEastGo()  { lightState &= 0xFFFF0000; bitSet(lightState,N_RED);   bitSet(lightState,S_RED);   bitSet(lightState,E_GREEN); bitSet(lightState,W_RED);   updateShiftRegister(); }
+void setWestGo()  { lightState &= 0xFFFF0000; bitSet(lightState,N_RED);   bitSet(lightState,S_RED);   bitSet(lightState,E_RED);   bitSet(lightState,W_GREEN); updateShiftRegister(); }
+
 void setTransitionLights(ManualState prev) {
   lightState &= 0xFFFF0000;
   if      (prev == MAN_N_GO) { bitSet(lightState,N_YELLOW); bitSet(lightState,S_RED); bitSet(lightState,E_RED); bitSet(lightState,W_RED); }
@@ -594,23 +647,21 @@ void setTransitionLights(ManualState prev) {
 }
 
 // =============================================================
-// 14. LCD CHARACTER LAYOUT MANAGEMENT ENGINE
+// 14. LCD
 // =============================================================
 void updateLCD(String l1, String l2, String l3, String l4) {
-  if (l1 != lastLine1) { lcd.setCursor(0,0); lcd.print("                    "); lcd.setCursor(0,0); lcd.print(l1.substring(0, 20)); lastLine1 = l1; }
-  if (l2 != lastLine2) { lcd.setCursor(0,1); lcd.print("                    "); lcd.setCursor(0,1); lcd.print(l2.substring(0, 20)); lastLine2 = l2; }
-  if (l3 != lastLine3) { lcd.setCursor(0,2); lcd.print("                    "); lcd.setCursor(0,2); lcd.print(l3.substring(0, 20)); lastLine3 = l3; } 
-  if (l4 != lastLine4) { lcd.setCursor(0,3); lcd.print("                    "); lcd.setCursor(0,3); lcd.print(l4.substring(0, 20)); lastLine4 = l4; }
+  if (l1 != lastLine1) { lcd.setCursor(0,0); lcd.print("                    "); lcd.setCursor(0,0); lcd.print(l1); lastLine1 = l1; }
+  if (l2 != lastLine2) { lcd.setCursor(0,1); lcd.print("                    "); lcd.setCursor(0,1); lcd.print(l2); lastLine2 = l2; }
+  if (l3 != lastLine3) { lcd.setCursor(0,2); lcd.print("                    "); lcd.setCursor(0,2); lcd.print(l3); lastLine3 = l3; } 
+  if (l4 != lastLine4) { lcd.setCursor(0,3); lcd.print("                    "); lcd.setCursor(0,3); lcd.print(l4); lastLine4 = l4; }
 }
 
 // =============================================================
-// 15. 7-SEGMENT PER-LANE TIMERS
+// 15. 7-SEGMENT PER-LANE TIMERS (Supports 3 Digits)
 // =============================================================
-void updateTimers(int n, int s, int e, int w, bool forceClear) {
-  if (forceClear || n != lastN) { showCentered(timerNorth, n); lastN = n; }
-  if (forceClear || s != lastS) { showCentered(timerSouth, s); lastS = s; }
-  if (forceClear || e != lastE) { showCentered(timerEast,  e); lastE = e; }
-  if (forceClear || w != lastW) { showCentered(timerWest,  w); lastW = w; }
+void updateTimers(int n, int s, int e, int w) {
+  showCentered(timerNorth, n); showCentered(timerSouth, s);
+  showCentered(timerEast,  e); showCentered(timerWest,  w);
 }
 
 void showCentered(Adafruit_7segment &disp, int number) {
@@ -638,42 +689,8 @@ void showCentered(Adafruit_7segment &disp, int number) {
 }
 
 // =============================================================
-// 16. EXPLICIT LIGHT HARDWARE BACKPLANE FEEDBACK BROADCASTER
+// 16. DEBOUNCED BUTTON
 // =============================================================
-void broadcastManualStates() {
-  String lanes[] = {"NORTH", "SOUTH", "EAST", "WEST"};
-  int greens[]   = {N_GREEN, S_GREEN, E_GREEN, W_GREEN};
-  int yellows[]  = {N_YELLOW, S_YELLOW, E_YELLOW, W_YELLOW};
-  
-  for (int i = 0; i < 4; i++) {
-    String currentLamp = "RED";
-    if (bitRead(lightState, greens[i]))       currentLamp = "GREEN";
-    else if (bitRead(lightState, yellows[i])) currentLamp = "YELLOW";
-    
-    Serial.println("STATE:" + lanes[i] + "," + currentLamp);
-  }
-}
-
-// =============================================================
-// 17. DEBOUNCED BUTTON & PERIPHERALS INDICATORS
-// =============================================================
-void syncIndicatorLEDs() {
-  lightState &= 0x0000FFFF;
-  if (currentMode == AUTO) {
-    bitSet(lightState, ledBlue);
-  } else {
-    bitSet(lightState, ledWhite);
-    if      (manualState == MAN_EMERGENCY)                    bitSet(lightState, ledRed);
-    else if (manualHazardActive)                               bitSet(lightState, ledYellow);
-    else {
-      if (manualState == MAN_N_GO || manualTarget == MAN_N_GO) bitSet(lightState, ledNorth);
-      if (manualState == MAN_S_GO || manualTarget == MAN_S_GO) bitSet(lightState, ledSouth);
-      if (manualState == MAN_E_GO || manualTarget == MAN_E_GO) bitSet(lightState, ledEast);
-      if (manualState == MAN_W_GO || manualTarget == MAN_W_GO) bitSet(lightState, ledWest);
-    }
-  }
-}
-
 bool checkButtonPress(int pin) {
   static bool       init      = false;
   static int           last[40]  = {};
