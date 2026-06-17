@@ -1,9 +1,9 @@
 """
 STAP: Smart Traffic Automation Program
 =======================================
-v17.0 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
-        with On-Screen Signal HUD Driven Strictly by ESP32 Serial Handshakes,
-        Big Approach Labels, and Real-Time Spatial Occupancy Tracking.
+v17.2 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
+        with Clean Top Quad Labels, Real-Time Hardware Signal Sync Mirroring,
+        and Dynamic Spatial Occupancy Tracking.
 """
 
 from ultralytics import YOLO
@@ -53,6 +53,9 @@ PHASE_ORDER = ["NORTH", "SOUTH", "EAST", "WEST"]
 # --- DYNAMIC CSV TIME MATRIX TRACKING CONFIGS ---
 CSV_LOG_INTERVAL = 300 
 last_csv_log_time = time.time()
+
+# --- HAZARD RECOGNITION TRACKING REGISTER ---
+last_hazard_blink_time = 0.0
 
 # --- ADVANCED HUD LANE-SPECIFIC INTERSECTION COLOR REGISTERS (BGR Format) ---
 ROI_COLORS = {
@@ -428,7 +431,6 @@ rain_detected   = False
 manual_override = False
 last_comm_time  = time.time()
 
-# --- HIGH-FIDELITY SERIAL COMMAND PARSING CHANNELS ---
 def read_serial_incoming():
     global rain_detected, manual_override, last_comm_time
     if ser and ser.in_waiting:
@@ -438,7 +440,6 @@ def read_serial_incoming():
             
             last_comm_time = time.time()
             
-            # 1. Parse environmental feedback conditions
             if "RAIN:" in line and "MODE:" in line:
                 for part in line.split(","):
                     if part.startswith("RAIN:"):
@@ -446,9 +447,7 @@ def read_serial_incoming():
                     elif part.startswith("MODE:"):
                         manual_override = (part.split(":")[1] == "MANUAL")
             
-            # 2. Intercept actual feedback confirmation tokens (e.g. "STATE:NORTH,GREEN")
             elif line.startswith("STATE:"):
-                # Clean prefix away
                 payload = line.replace("STATE:", "")
                 lane, hardware_lamp = payload.split(",")
                 if lane in LANE_NAMES and hardware_lamp in ["RED", "YELLOW", "GREEN"]:
@@ -792,6 +791,12 @@ try:
         display_greens = {lane: compute_green_time(lane, rain_detected) for lane in LANE_NAMES}
         display_greens[snap_lane] = snap_green
 
+        # --- DYNAMIC HAZARD BLINK OVERRIDE FILTER PATTERN CHANNELS ---
+        if all(local_manual_lights.get(l) == "YELLOW" for l in LANE_NAMES):
+            last_hazard_blink_time = now
+            
+        is_hazard_pattern_active = (now - last_hazard_blink_time < 1.5)
+
         drawn = list(imgs)
         for idx, lane in enumerate(LANE_NAMES):
             fr = drawn[idx]
@@ -802,8 +807,8 @@ try:
             cv2.addWeighted(overlay, ROI_ALPHA, fr, 1.0 - ROI_ALPHA, 0, fr)
             cv2.polylines(fr, [ROI_POLYGONS[lane]], isClosed=True, color=lane_color, thickness=2)
 
-            # --- BIG APPROACH IDENTIFIER TEXT HUD LAYER ---
-            label_text = f"--- {lane} APPROACH ---"
+            # --- BIG APPROACH IDENTIFIER TEXT HUD LAYER (Refactored Clean Labels) ---
+            label_text = f"{lane}"
             text_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_DUPLEX, 0.75, 2)[0]
             text_x = (CAM_WIDTH - text_size[0]) // 2
             cv2.putText(fr, label_text, (text_x + 1, 31), cv2.FONT_HERSHEY_DUPLEX, 0.75, (0, 0, 0), 2, cv2.LINE_AA)
@@ -820,13 +825,17 @@ try:
             light_is_green  = False
 
             if manual_override:
-                # --- READ HARWARE LIGHT STATUS FROM REGISTER (Driven by ESP32 Feedback Strings) ---
                 current_hardware_lamp = local_manual_lights.get(lane, "RED")
-                if current_hardware_lamp == "GREEN":     light_is_green = True
-                elif current_hardware_lamp == "YELLOW": light_is_yellow = True
-                else:                                  light_is_red = True
+                if current_hardware_lamp == "GREEN":     
+                    light_is_green = True
+                elif current_hardware_lamp == "YELLOW": 
+                    light_is_yellow = True
+                else:                                  
+                    if is_hazard_pattern_active:
+                        light_is_red = False
+                    else:
+                        light_is_red = True
             else:
-                # Maintain automated pattern logic passes
                 if snap_state == "ALL_RED":
                     light_is_red = True
                 elif lane == snap_lane:
@@ -880,6 +889,8 @@ try:
                 status_text = f"EMG VEHICLE DETECTED [{streak:.1f}s]"
             elif manual_override:
                 status_text = f"MANUAL CONTROL ACTIVE (Driven by ESP32 via Serial)"
+                if is_hazard_pattern_active:
+                    status_text = f"HAZARD MODE: FLASHING YELLOW"
             else:
                 status_text = f"AUTOMATED STATE: RUNNING"
 
@@ -891,6 +902,8 @@ try:
         if any(v == "EMERGENCY" for v in local_statuses.values()):
             mode_label = "!!! EMERGENCY PREEMPTION ACTIVE !!!"; hud_color = (0, 0, 255)
         elif rain_detected: mode_label += " + CONDITIONAL RAIN BUFFERS"
+        if is_hazard_pattern_active and manual_override:
+            mode_label = "HAZARD OVERRIDE PATTERN GENERATED"; hud_color = (0, 165, 255)
 
         cv2.putText(grid, f"SYSTEM MODE: {mode_label}", (15, grid.shape[0]-50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, hud_color, 2)
         
@@ -1021,7 +1034,7 @@ try:
 
 finally:
     # =============================================================
-    # 11. CLEANUP EXITS & FINAL REPORT
+    # 11. CLEANUP EXITS & FINAL ABSOLUTE GRAND TOTALS SUMMARY REPORT
     # =============================================================
     print("\n[STAP] 🛑 Shutdown Signal Intercepted. Closing background modules cleanly...")
     
