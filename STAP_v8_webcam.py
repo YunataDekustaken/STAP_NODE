@@ -2,7 +2,7 @@
 STAP: Smart Traffic Automation Program
 =======================================
 v17.2-ToyCarLive — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
-                  with Corrected Native Webcam ROI Canvas Calibration.
+                  with Corrected Native Webcam ROI Canvas Calibration and Reinforced Emergency Preemption Filtering.
 """
 
 from ultralytics import YOLO
@@ -48,8 +48,6 @@ VEHICLE_CLASS_IDS   = [0, 2, 3, 4, 6, 7, 8, 10, 11, 12, 13]
 
 LANE_NAMES  = ["NORTH", "SOUTH", "EAST", "WEST"]
 PHASE_ORDER = ["NORTH", "SOUTH", "EAST", "WEST"]
-
-CAMERA_INDICES = [0, 1, 2, 3] 
 
 CSV_LOG_INTERVAL = 300 
 last_csv_log_time = time.time()
@@ -205,18 +203,16 @@ count_smoother = VehicleCountSmoother(COUNT_SMOOTH_WINDOW)
 # =============================================================
 # 4. INITIALIZE LIVE WEBCAMS VIA STABLE INDEX TARGETING
 # =============================================================
-# Replace these numbers with the exact indices you saw in Step 1:
-#                 NORTH  SOUTH   EAST   WEST
-CAMERA_INDICES = [  3,     2,     0,     1  ] # <-- Just change these 4 numbers!
+#                   NORTH  SOUTH   EAST   WEST
+CAMERA_INDICES = [   3,     2,     0,     1  ] 
 
 caps = []
 print("[STAP] Launching hardware webcam array and establishing ROI matrix scales...")
 
 for i, idx in enumerate(CAMERA_INDICES):
     lane = LANE_NAMES[i]
-    cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW) # Forced DirectShow backend
+    cap = cv2.VideoCapture(idx, cv2.CAP_DSHOW) 
     
-    # Set high-res properties so the scaling engine maps your ROIs perfectly
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
     caps.append(cap)
@@ -239,7 +235,6 @@ for i, idx in enumerate(CAMERA_INDICES):
 
 last_reconnect_time = [0.0, 0.0, 0.0, 0.0]
 
-# Build "NO SIGNAL" placeholder template frame
 blank_frame = np.zeros((CAM_HEIGHT, CAM_WIDTH, 3), dtype=np.uint8)
 text_size = cv2.getTextSize("NO SIGNAL", cv2.FONT_HERSHEY_SIMPLEX, 1.5, 3)[0]
 text_x = (CAM_WIDTH - text_size[0]) // 2
@@ -486,9 +481,10 @@ def reset_all_manual_lights_to_red():
             manual_lane_lights[lane] = "RED"
 
 def emergency_lane():
-    with result_lock:
-        for lane, status in lane_statuses.items():
-            if status == "EMERGENCY": return lane
+    # TOYCAR FIX: Enforce the 3-second rule directly using the buffer confirmation flags
+    for lane in LANE_NAMES:
+        if emg_buffer.is_confirmed(lane):
+            return lane
     return None
 
 def post_to_hub():
@@ -765,7 +761,7 @@ try:
                     print(f"[STAP] ⚠️ Camera {LANE_NAMES[i]} lost index. Re-grabbing stream...")
                     cap.release()
                     caps[i] = cv2.VideoCapture(CAMERA_INDICES[i])
-                    caps[i].set(cv2.CAP_PROP_FRAME_WIDTH, 1920) # Initialize explicitly in high-res canvas space
+                    caps[i].set(cv2.CAP_PROP_FRAME_WIDTH, 1920) 
                     caps[i].set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
                     last_reconnect_time[i] = t_loop
             else:
@@ -969,10 +965,10 @@ try:
             cv2.line(dashboard_img, (15, db_h-75), (db_w-15, db_h-75), (55, 55, 55), 1)
             
             density_row = f"{'LIVE DENSITY':<14}"\
-                          f"{local_occupancy['NORTH']:.1f}%   "\
-                          f"{local_occupancy['SOUTH']:.1f}%   "\
-                          f"{local_occupancy['EAST']:.1f}%   "\
-                          f"{local_occupancy['WEST']:.1f}%   "
+                          f"{local_occupancy['NORTH']:.1f}%    "\
+                          f"{local_occupancy['SOUTH']:.1f}%    "\
+                          f"{local_occupancy['EAST']:.1f}%    "\
+                          f"{local_occupancy['WEST']:.1f}%    "
             cv2.putText(dashboard_img, density_row, (20, db_h-55), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 215, 255), 1)
 
             cv2.line(dashboard_img, (15, db_h-45), (db_w-15, db_h-45), (0, 255, 255), 1)
@@ -1023,11 +1019,15 @@ try:
             with lane_stream_locks[lane]:
                 global_lane_frames[lane] = drawn[idx].copy()
 
+        # TOYCAR IMPLEMENTATION FIX: Check emergency buffer stability directly
         if not manual_override:
             if snap_state == "GREEN":
                 emg = emergency_lane()
-                if emg and emg != snap_lane: start_yellow(snap_lane)
-                elif now - snap_g_start >= snap_green: start_yellow(snap_lane)
+                if emg and emg != snap_lane: 
+                    print(f"[STAP] 🚨 Confirmed Emergency vehicle on {emg} approach sustained for 3s. Preempting active lane.")
+                    start_yellow(snap_lane)
+                elif now - snap_g_start >= snap_green: 
+                    start_yellow(snap_lane)
             elif snap_state == "YELLOW":
                 if now - snap_y_start >= YELLOW_TIME: start_all_red()
             elif snap_state == "ALL_RED":
