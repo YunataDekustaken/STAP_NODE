@@ -214,7 +214,7 @@ count_smoother = VehicleCountSmoother(COUNT_SMOOTH_WINDOW)
 # 4. INITIALIZE LIVE WEBCAMS VIA STABLE INDEX TARGETING
 # =============================================================
 #                   NORTH  SOUTH   EAST   WEST
-CAMERA_INDICES = [   3,     2,     0,     1  ] 
+CAMERA_INDICES = [   2,     3,     0,     1  ] 
 
 caps = []
 print("[STAP] Launching hardware webcam array and establishing ROI matrix scales...")
