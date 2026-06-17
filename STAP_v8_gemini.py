@@ -1,9 +1,9 @@
 """
 STAP: Smart Traffic Automation Program
 =======================================
-v17.2 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
-        with Clean Top Quad Labels, Real-Time Hardware Signal Sync Mirroring,
-        and Dynamic Spatial Occupancy Tracking.
+v17.2.1 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
+         with Clean Top Quad Labels, Real-Time Hardware Signal Sync Mirroring,
+         Dynamic Spatial Occupancy Tracking, and Reinforced Emergency Preemption Filtering.
 """
 
 from ultralytics import YOLO
@@ -246,6 +246,7 @@ class BackgroundVideoReader(threading.Thread):
     def __init__(self, index, path):
         super().__init__(daemon=True)
         self.index = index
+        self.path  = path
         self.cap   = cv2.VideoCapture(path)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         fps = self.cap.get(cv2.CAP_PROP_FPS)
@@ -491,9 +492,10 @@ def reset_all_manual_lights_to_red():
             manual_lane_lights[lane] = "RED"
 
 def emergency_lane():
-    with result_lock:
-        for lane, status in lane_statuses.items():
-            if status == "EMERGENCY": return lane
+    # DIRECT FIX: Check the buffer status directly to enforce the 3-second rule
+    for lane in LANE_NAMES:
+        if emg_buffer.is_confirmed(lane):
+            return lane
     return None
 
 def post_to_hub():
@@ -807,7 +809,7 @@ try:
             cv2.addWeighted(overlay, ROI_ALPHA, fr, 1.0 - ROI_ALPHA, 0, fr)
             cv2.polylines(fr, [ROI_POLYGONS[lane]], isClosed=True, color=lane_color, thickness=2)
 
-            # --- BIG APPROACH IDENTIFIER TEXT HUD LAYER (Refactored Clean Labels) ---
+            # --- BIG APPROACH IDENTIFIER TEXT HUD LAYER ---
             label_text = f"{lane}"
             text_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_DUPLEX, 0.75, 2)[0]
             text_x = (CAM_WIDTH - text_size[0]) // 2
@@ -830,7 +832,7 @@ try:
                     light_is_green = True
                 elif current_hardware_lamp == "YELLOW": 
                     light_is_yellow = True
-                else:                                  
+                else:                                   
                     if is_hazard_pattern_active:
                         light_is_red = False
                     else:
@@ -883,7 +885,7 @@ try:
             is_emg_confirmed = local_statuses[lane] == "EMERGENCY"
             is_emg_charging  = emg_buffer.is_charging(lane)
 
-            if is_emg_confirmed: sc = (0, 0, 255); status_text = f"EMERGENCY PRIORITY"
+            if is_emg_confirmed: status_text = f"EMERGENCY PRIORITY"
             elif is_emg_charging:
                 streak = emg_buffer.streak_elapsed(lane)
                 status_text = f"EMG VEHICLE DETECTED [{streak:.1f}s]"
@@ -960,10 +962,10 @@ try:
             cv2.line(dashboard_img, (15, db_h-75), (db_w-15, db_h-75), (55, 55, 55), 1)
             
             density_row = f"{'LIVE DENSITY':<14}"\
-                          f"{local_occupancy['NORTH']:.1f}%  "\
-                          f"{local_occupancy['SOUTH']:.1f}%  "\
-                          f"{local_occupancy['EAST']:.1f}%  "\
-                          f"{local_occupancy['WEST']:.1f}%  "
+                          f"{local_occupancy['NORTH']:.1f}%   "\
+                          f"{local_occupancy['SOUTH']:.1f}%   "\
+                          f"{local_occupancy['EAST']:.1f}%   "\
+                          f"{local_occupancy['WEST']:.1f}%   "
             cv2.putText(dashboard_img, density_row, (20, db_h-55), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 215, 255), 1)
 
             cv2.line(dashboard_img, (15, db_h-45), (db_w-15, db_h-45), (0, 255, 255), 1)
@@ -1014,11 +1016,15 @@ try:
             with lane_stream_locks[lane]:
                 global_lane_frames[lane] = drawn[idx].copy()
 
+        # DIRECT FIX: State machine checking now relies on fixed emergency_lane helper
         if not manual_override:
             if snap_state == "GREEN":
                 emg = emergency_lane()
-                if emg and emg != snap_lane: start_yellow(snap_lane)
-                elif now - snap_g_start >= snap_green: start_yellow(snap_lane)
+                if emg and emg != snap_lane: 
+                    print(f"[STAP] 🚨 Confirmed Emergency detected on {emg} approach. Forcing cycle shift.")
+                    start_yellow(snap_lane)
+                elif now - snap_g_start >= snap_green: 
+                    start_yellow(snap_lane)
             elif snap_state == "YELLOW":
                 if now - snap_y_start >= YELLOW_TIME: start_all_red()
             elif snap_state == "ALL_RED":

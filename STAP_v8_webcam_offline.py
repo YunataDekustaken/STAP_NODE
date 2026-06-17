@@ -37,7 +37,7 @@ app = Flask(__name__)
 SERIAL_PORT = "COM11"
 BAUD_RATE   = 115200
 
-MODEL_PATH = r"C:\Users\Raphael\Desktop\YOLO\mayor_gil6\runs\detect\train\weights\best.pt"
+MODEL_PATH = r"C:\Users\Raphael\Desktop\YOLO\TOY_CAR\runs\detect\train\weights\best.pt"
 
 EMERGENCY_CLASS_IDS = [0, 5, 9]   # ambulance=0, firetruck=5, police=9
 VEHICLE_CLASS_IDS   = [1, 2, 3, 4, 6, 7, 8, 10, 11, 12, 13]
