@@ -1,9 +1,10 @@
 """
 STAP: Smart Traffic Automation Program
 =======================================
-v17.2.1 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
-         with Clean Top Quad Labels, Real-Time Hardware Signal Sync Mirroring,
-         Dynamic Spatial Occupancy Tracking, and Reinforced Emergency Preemption Filtering.
+v17.2.2 — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
+        with Clean Top Quad Labels, Real-Time Hardware Signal Sync Mirroring,
+        Dynamic Spatial Occupancy Tracking, Reinforced Emergency Preemption Filtering,
+        and Inverted Outbound Signal Structural Mapping.
 """
 
 from ultralytics import YOLO
@@ -49,6 +50,15 @@ VEHICLE_CLASS_IDS   = [1, 2, 3, 4, 6, 7, 8, 10, 11, 12, 13]
 
 LANE_NAMES  = ["NORTH", "SOUTH", "EAST", "WEST"]
 PHASE_ORDER = ["NORTH", "SOUTH", "EAST", "WEST"]
+
+# --- OUTBOUND PHYSICAL INTERSECTION MAP ENGINE ---
+# Resolves location approach camera matching vs outbound directional viewing structure layout
+OPPOSITE_LIGHT_MAP = {
+    "NORTH": "SOUTH",  # North approach cars physically read the South traffic light signal
+    "SOUTH": "NORTH",  # South approach cars physically read the North traffic light signal
+    "EAST":  "WEST",   # East approach cars physically read the West traffic light signal
+    "WEST":  "EAST"    # West approach cars physically read the East traffic light signal
+}
 
 # --- DYNAMIC CSV TIME MATRIX TRACKING CONFIGS ---
 CSV_LOG_INTERVAL = 300 
@@ -246,7 +256,6 @@ class BackgroundVideoReader(threading.Thread):
     def __init__(self, index, path):
         super().__init__(daemon=True)
         self.index = index
-        self.path  = path
         self.cap   = cv2.VideoCapture(path)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         fps = self.cap.get(cv2.CAP_PROP_FPS)
@@ -492,7 +501,6 @@ def reset_all_manual_lights_to_red():
             manual_lane_lights[lane] = "RED"
 
 def emergency_lane():
-    # DIRECT FIX: Check the buffer status directly to enforce the 3-second rule
     for lane in LANE_NAMES:
         if emg_buffer.is_confirmed(lane):
             return lane
@@ -678,7 +686,10 @@ def start_yellow(lane: str):
     with phase_lock:
         phase_state       = "YELLOW"
         yellow_start_time = time.time()
-    send_to_esp32(f"YELLOW:{lane}")
+    
+    # STRUCTURAL FIX: Invert automated approach string payload to match driver sight lines
+    target_light = OPPOSITE_LIGHT_MAP[lane]
+    send_to_esp32(f"YELLOW:{target_light}")
     send_to_esp32(f"DISPLAY:YELLOW,{YELLOW_TIME}")
 
 def start_all_red():
@@ -699,7 +710,10 @@ def start_green(next_lane: str, duration: int):
         yellow_start_time  = 0.0
         all_red_start_time = 0.0
         committed_green    = duration
-    send_to_esp32(f"PHASE:{next_lane},DURATION:{duration}")
+        
+    # STRUCTURAL FIX: Invert automated approach string payload to match driver sight lines
+    target_light = OPPOSITE_LIGHT_MAP[next_lane]
+    send_to_esp32(f"PHASE:{target_light},DURATION:{duration}")
     send_to_esp32("DISPLAY:OFF")
 
 def advance_phase():
@@ -718,7 +732,11 @@ def keepalive_thread():
     while True:
         time.sleep(PING_INTERVAL)
         with phase_lock: active = PHASE_ORDER[current_phase_idx]
-        send_to_esp32(f"PING:{active}")
+        
+        # STRUCTURAL FIX: Ping correct target frame node layout over COM channel
+        target_light = OPPOSITE_LIGHT_MAP[active]
+        send_to_esp32(f"PING:{target_light}")
+        
         hub_tick += 1
         if hub_tick >= HUB_INTERVAL_TICKS:
             hub_tick = 0
@@ -962,10 +980,10 @@ try:
             cv2.line(dashboard_img, (15, db_h-75), (db_w-15, db_h-75), (55, 55, 55), 1)
             
             density_row = f"{'LIVE DENSITY':<14}"\
-                          f"{local_occupancy['NORTH']:.1f}%   "\
-                          f"{local_occupancy['SOUTH']:.1f}%   "\
-                          f"{local_occupancy['EAST']:.1f}%   "\
-                          f"{local_occupancy['WEST']:.1f}%   "
+                          f"{local_occupancy['NORTH']:.1f}%    "\
+                          f"{local_occupancy['SOUTH']:.1f}%    "\
+                          f"{local_occupancy['EAST']:.1f}%    "\
+                          f"{local_occupancy['WEST']:.1f}%    "
             cv2.putText(dashboard_img, density_row, (20, db_h-55), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 215, 255), 1)
 
             cv2.line(dashboard_img, (15, db_h-45), (db_w-15, db_h-45), (0, 255, 255), 1)
@@ -1016,12 +1034,11 @@ try:
             with lane_stream_locks[lane]:
                 global_lane_frames[lane] = drawn[idx].copy()
 
-        # DIRECT FIX: State machine checking now relies on fixed emergency_lane helper
         if not manual_override:
             if snap_state == "GREEN":
                 emg = emergency_lane()
                 if emg and emg != snap_lane: 
-                    print(f"[STAP] 🚨 Confirmed Emergency detected on {emg} approach. Forcing cycle shift.")
+                    print(f"[STAP] 🚨 Confirmed Emergency vehicle on {emg} approach sustained for 3s. Preempting active lane.")
                     start_yellow(snap_lane)
                 elif now - snap_g_start >= snap_green: 
                     start_yellow(snap_lane)
