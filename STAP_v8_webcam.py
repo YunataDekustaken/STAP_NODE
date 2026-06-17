@@ -1,8 +1,9 @@
 """
 STAP: Smart Traffic Automation Program
 =======================================
-v17.2-ToyCarLive — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
-                  with Corrected Native Webcam ROI Canvas Calibration and Reinforced Emergency Preemption Filtering.
+v17.2.1-ToyCarLive — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
+                  with Corrected Native Webcam ROI Canvas Calibration, Reinforced Emergency 
+                  Preemption Filtering, and Inverted Outbound Signal Structural Mapping.
 """
 
 from ultralytics import YOLO
@@ -48,6 +49,15 @@ VEHICLE_CLASS_IDS   = [0, 2, 3, 4, 6, 7, 8, 10, 11, 12, 13]
 
 LANE_NAMES  = ["NORTH", "SOUTH", "EAST", "WEST"]
 PHASE_ORDER = ["NORTH", "SOUTH", "EAST", "WEST"]
+
+# --- OUTBOUND PHYSICAL INTERSECTION MAP ENGINE ---
+# Resolves location approach camera matching vs outbound directional viewing structure layout
+OPPOSITE_LIGHT_MAP = {
+    "NORTH": "SOUTH",  # North approach cars physically read the South traffic light signal
+    "SOUTH": "NORTH",  # South approach cars physically read the North traffic light signal
+    "EAST":  "WEST",   # East approach cars physically read the West traffic light signal
+    "WEST":  "EAST"    # West approach cars physically read the East traffic light signal
+}
 
 CSV_LOG_INTERVAL = 300 
 last_csv_log_time = time.time()
@@ -481,7 +491,6 @@ def reset_all_manual_lights_to_red():
             manual_lane_lights[lane] = "RED"
 
 def emergency_lane():
-    # TOYCAR FIX: Enforce the 3-second rule directly using the buffer confirmation flags
     for lane in LANE_NAMES:
         if emg_buffer.is_confirmed(lane):
             return lane
@@ -667,7 +676,10 @@ def start_yellow(lane: str):
     with phase_lock:
         phase_state       = "YELLOW"
         yellow_start_time = time.time()
-    send_to_esp32(f"YELLOW:{lane}")
+    
+    # STRUCTURAL FIX: Invert automated approach string payload to match driver sight lines
+    target_light = OPPOSITE_LIGHT_MAP[lane]
+    send_to_esp32(f"YELLOW:{target_light}")
     send_to_esp32(f"DISPLAY:YELLOW,{YELLOW_TIME}")
 
 def start_all_red():
@@ -688,7 +700,10 @@ def start_green(next_lane: str, duration: int):
         yellow_start_time  = 0.0
         all_red_start_time = 0.0
         committed_green    = duration
-    send_to_esp32(f"PHASE:{next_lane},DURATION:{duration}")
+        
+    # STRUCTURAL FIX: Invert automated approach string payload to match driver sight lines
+    target_light = OPPOSITE_LIGHT_MAP[next_lane]
+    send_to_esp32(f"PHASE:{target_light},DURATION:{duration}")
     send_to_esp32("DISPLAY:OFF")
 
 def advance_phase():
@@ -707,7 +722,11 @@ def keepalive_thread():
     while True:
         time.sleep(PING_INTERVAL)
         with phase_lock: active = PHASE_ORDER[current_phase_idx]
-        send_to_esp32(f"PING:{active}")
+        
+        # STRUCTURAL FIX: Ping correct target frame node layout over COM channel
+        target_light = OPPOSITE_LIGHT_MAP[active]
+        send_to_esp32(f"PING:{target_light}")
+        
         hub_tick += 1
         if hub_tick >= HUB_INTERVAL_TICKS:
             hub_tick = 0
@@ -750,7 +769,6 @@ try:
         read_serial_incoming()
         is_offline = (ser is None) or (t_loop - last_comm_time > DATA_TIMEOUT)
 
-        # 1. READ ALL 4 WEBCAMS INLINE (EXACT RECOVERY STRUCT)
         current_frames = []
         for i, cap in enumerate(caps):
             ret, frame = cap.read()
@@ -1019,7 +1037,6 @@ try:
             with lane_stream_locks[lane]:
                 global_lane_frames[lane] = drawn[idx].copy()
 
-        # TOYCAR IMPLEMENTATION FIX: Check emergency buffer stability directly
         if not manual_override:
             if snap_state == "GREEN":
                 emg = emergency_lane()
