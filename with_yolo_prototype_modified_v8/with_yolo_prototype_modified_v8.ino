@@ -1,8 +1,8 @@
 /*
-  STAP ESP32 Controller — Firmware v17.6 (Emergency Clearing Protection)
+  STAP ESP32 Controller — Firmware v17.7 (LCD String Optimization)
   =====================================================================
-  Safely transitions live lanes to yellow for a 3-second clearance window
-  when emergency override is triggered manually before locking down to all red.
+  All text screens optimized to fit within strict 20-character line lengths
+  to fix clipped data arrays or trailing character overlap artifacts.
 */
 
 #include <Wire.h>
@@ -423,7 +423,8 @@ void runAutoOnline(unsigned long ms) {
       break;
   }
 
-  String title  = rainDetected ? "-- AUTO (+RAIN) --" : "-- AUTO (SMART AI) --";
+  // FIXED: Adjusted header title lengths down to < 20 characters
+  String title  = rainDetected ? "- AUTO (+RAIN) -" : "- AUTO (SMART AI) -";
   String sigStr;
   int    disp   = 0;
 
@@ -434,7 +435,7 @@ void runAutoOnline(unsigned long ms) {
     sigStr = "YELLOW";
     disp   = max(0, YELLOW_TIME - (int)((ms - yellowStartMillis) / 1000));
   } else {
-    sigStr = "--- ALL RED ---";
+    sigStr = "ALL RED";
   }
 
   String cntLine = (onlineSignal == SIG_WAITING)
@@ -497,8 +498,9 @@ void runAutoFallback(unsigned long ms) {
   updateTimers(timers[0], timers[1], timers[2], timers[3]);
 
   String sig  = fallbackInYellow ? "YELLOW" : "GREEN";
-  updateLCD("-- AUTO FALLBACK --", "NETWORK LOSS",
-            "Active: " + fbLane + " [" + sig + "]",
+  // FIXED: Concatenated dynamic strings rewritten to guarantee total length <= 20 chars
+  updateLCD("- AUTO FALLBACK -", "NETWORK LOSS",
+            "Lane: " + fbLane + " (" + sig + ")",
             "Countdown: " + String(currentRemaining) + "s");
 }
 
@@ -506,14 +508,11 @@ void runAutoFallback(unsigned long ms) {
 // 12. MANUAL OVERRIDE
 // =============================================================
 void handleManual(unsigned long ms) {
-  // FIXED: Red Button (btnEmergency) now handles a safe 3-second yellow grace block
   if (checkButtonPress(btnEmergency)) {
     if (manualState == MAN_EMERGENCY || (manualState == MAN_TRANSITION && manualTarget == MAN_EMERGENCY)) {
-      // If already cleared or actively moving to lockdown, disengage back to safe manual stop
       manualState = MAN_STOPPED; manualTarget = MAN_STOPPED;
       setAllRed(); updateShiftRegister();
     } else {
-      // Begin standard yellow decay interval for whatever lane is active before locking red
       prevManualState = manualState; 
       manualTarget = MAN_EMERGENCY; 
       manualTransitionStart = ms;
@@ -540,7 +539,7 @@ void handleManual(unsigned long ms) {
     if ((ms / 500) % 2 == 0) blinkYellows();
     else { lightState &= 0xFFFF0000; updateShiftRegister(); }
     updateTimers(-1, -1, -1, -1);
-    updateLCD("--- MANUAL MODE ---", ">> STATUS: HAZARD", "Flashing Yellows", "Yield all traffic");
+    updateLCD("--- MANUAL MODE ---", "STATUS: HAZARD", "Flashing Yellows", "Yield All Traffic");
     return;
   }
 
@@ -562,11 +561,10 @@ void handleManual(unsigned long ms) {
     else if (prevManualState == MAN_W_GO) updateTimers(-1, -1, -1, remaining);
     else                                 updateTimers(-1, -1, -1, -1);
     
-    // UI HUD adaptation for the clearing sequence
     if (manualTarget == MAN_EMERGENCY) {
-      updateLCD("!!! OVERRIDE !!!", ">> EMERGENCY CLEAR", "Yellow: " + String(remaining) + "s", "Securing crossbox");
+      updateLCD("!!! OVERRIDE !!!", "EMERGENCY CLEAR", "Yellow: " + String(remaining) + "s", "Securing crossbox");
     } else {
-      updateLCD("--- MANUAL MODE ---", ">> SWITCHING LANES", "Wait: " + String(remaining) + "s", "Changing active lane");
+      updateLCD("--- MANUAL MODE ---", "SWITCHING LANES", "Wait: " + String(remaining) + "s", "Changing lane...");
     }
 
     if (elapsed >= (long)(YELLOW_TIME * 1000)) { 
@@ -576,11 +574,12 @@ void handleManual(unsigned long ms) {
     return;
   }
 
-  if      (manualState == MAN_N_GO) { setNorthGo(); updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: NORTH", "Manual override act.", "Select next lane ->"); }
-  else if (manualState == MAN_S_GO) { setSouthGo(); updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: SOUTH", "Manual override act.", "Select next lane ->"); }
-  else if (manualState == MAN_E_GO) { setEastGo();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: EAST",  "Manual override act.", "Select next lane ->"); }
-  else if (manualState == MAN_W_GO) { setWestGo();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: WEST",  "Manual override act.", "Select next lane ->"); }
-  else                               { setAllRed();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> REMOTE CONTROL", "All lanes RED", "Awaiting command..."); }
+  // FIXED: Simplified status messaging lengths to remove trailing LCD noise
+  if      (manualState == MAN_N_GO) { setNorthGo(); updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", "GO: NORTH", "Override Active", "Select next lane..."); }
+  else if (manualState == MAN_S_GO) { setSouthGo(); updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", "GO: SOUTH", "Override Active", "Select next lane..."); }
+  else if (manualState == MAN_E_GO) { setEastGo();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", "GO: EAST",  "Override Active", "Select next lane..."); }
+  else if (manualState == MAN_W_GO) { setWestGo();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", "GO: WEST",  "Override Active", "Select next lane..."); }
+  else                               { setAllRed();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", "REMOTE CONTROL", "All lanes RED", "Awaiting command..."); }
 }
 
 // =============================================================
