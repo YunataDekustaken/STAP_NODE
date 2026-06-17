@@ -1,8 +1,8 @@
 /*
-  STAP ESP32 Controller — Firmware v17.5 (Synchronized Feedback Engine)
+  STAP ESP32 Controller — Firmware v17.6 (Emergency Clearing Protection)
   =====================================================================
-  Natively broadcasts absolute hardware light states back across the 
-  serial channel during Manual Mode triggers to synchronize virtual HUDs.
+  Safely transitions live lanes to yellow for a 3-second clearance window
+  when emergency override is triggered manually before locking down to all red.
 */
 
 #include <Wire.h>
@@ -174,7 +174,6 @@ void loop() {
       "RAIN:" + String(rainDetected ? "1" : "0") +
       ",MODE:" + String(currentMode == MANUAL ? "MANUAL" : "AUTO")
     );
-    // Explicitly pulse manual lamp verification updates back down stream channels
     if (currentMode == MANUAL) {
       broadcastManualStates();
     }
@@ -215,7 +214,7 @@ void loop() {
     bool nowSilent = (ms - lastCommMillis > 1000);
     if (!nowSilent) {
       silenceStartMillis = 0;
-      isOffline          = false;
+      isOffline           = false;
     } else {
       if (silenceStartMillis == 0) silenceStartMillis = ms;
       if (!isOffline && (ms - silenceStartMillis >= DATA_TIMEOUT)) {
@@ -251,7 +250,7 @@ void loop() {
 }
 
 // =============================================================
-// 9. PYTHON COMMAND PARSER (With Verification Streaming Echoes)
+// 9. PYTHON COMMAND PARSER
 // =============================================================
 void parsePythonCommand(String msg) {
   if (msg.startsWith("PHASE:")   ||
@@ -332,7 +331,7 @@ void parsePythonCommand(String msg) {
     }
 
     updateTimers(-1, -1, -1, -1);
-    broadcastManualStates(); // Send absolute verification echoes back instantly
+    broadcastManualStates();
     return;
   }
 
@@ -507,16 +506,24 @@ void runAutoFallback(unsigned long ms) {
 // 12. MANUAL OVERRIDE
 // =============================================================
 void handleManual(unsigned long ms) {
+  // FIXED: Red Button (btnEmergency) now handles a safe 3-second yellow grace block
   if (checkButtonPress(btnEmergency)) {
-    if (manualState == MAN_EMERGENCY) {
+    if (manualState == MAN_EMERGENCY || (manualState == MAN_TRANSITION && manualTarget == MAN_EMERGENCY)) {
+      // If already cleared or actively moving to lockdown, disengage back to safe manual stop
       manualState = MAN_STOPPED; manualTarget = MAN_STOPPED;
       setAllRed(); updateShiftRegister();
     } else {
-      manualState = MAN_EMERGENCY; manualTarget = MAN_STOPPED;
-      manualHazardActive = false; updateShiftRegister();
+      // Begin standard yellow decay interval for whatever lane is active before locking red
+      prevManualState = manualState; 
+      manualTarget = MAN_EMERGENCY; 
+      manualTransitionStart = ms;
+      manualState = MAN_TRANSITION; 
+      manualHazardActive = false; 
+      updateShiftRegister();
     }
     broadcastManualStates();
   }
+
   if (manualState == MAN_EMERGENCY) {
     setAllRed(); updateTimers(-1, -1, -1, -1);
     updateLCD("!!! OVERRIDE !!!", "EMERGENCY LOCKDOWN", "All Lanes: RED", "Press EMG to clear");
@@ -538,7 +545,7 @@ void handleManual(unsigned long ms) {
   }
 
   if (manualState != MAN_TRANSITION) {
-    if      (checkButtonPress(btnGoNorth) && manualState != MAN_N_GO) { prevManualState = manualState; manualTarget = MAN_N_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; }
+    if       (checkButtonPress(btnGoNorth) && manualState != MAN_N_GO) { prevManualState = manualState; manualTarget = MAN_N_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; }
     else if (checkButtonPress(btnGoSouth) && manualState != MAN_S_GO) { prevManualState = manualState; manualTarget = MAN_S_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; }
     else if (checkButtonPress(btnGoEast)  && manualState != MAN_E_GO) { prevManualState = manualState; manualTarget = MAN_E_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; }
     else if (checkButtonPress(btnGoWest)  && manualState != MAN_W_GO) { prevManualState = manualState; manualTarget = MAN_W_GO; manualState = MAN_TRANSITION; manualTransitionStart = ms; }
@@ -548,13 +555,20 @@ void handleManual(unsigned long ms) {
   if (manualState == MAN_TRANSITION) {
     setTransitionLights(prevManualState); updateShiftRegister();
     long elapsed   = ms - manualTransitionStart;
-    int  remaining = max(0, YELLOW_TIME - (int)(elapsed / 1000));
-    if      (prevManualState == MAN_N_GO) updateTimers(remaining, -1, -1, -1);
+    int   remaining = max(0, YELLOW_TIME - (int)(elapsed / 1000));
+    if       (prevManualState == MAN_N_GO) updateTimers(remaining, -1, -1, -1);
     else if (prevManualState == MAN_S_GO) updateTimers(-1, remaining, -1, -1);
     else if (prevManualState == MAN_E_GO) updateTimers(-1, -1, remaining, -1);
     else if (prevManualState == MAN_W_GO) updateTimers(-1, -1, -1, remaining);
-    else                                  updateTimers(-1, -1, -1, -1);
-    updateLCD("--- MANUAL MODE ---", ">> SWITCHING LANES", "Wait: " + String(remaining) + "s", "Changing active lane");
+    else                                 updateTimers(-1, -1, -1, -1);
+    
+    // UI HUD adaptation for the clearing sequence
+    if (manualTarget == MAN_EMERGENCY) {
+      updateLCD("!!! OVERRIDE !!!", ">> EMERGENCY CLEAR", "Yellow: " + String(remaining) + "s", "Securing crossbox");
+    } else {
+      updateLCD("--- MANUAL MODE ---", ">> SWITCHING LANES", "Wait: " + String(remaining) + "s", "Changing active lane");
+    }
+
     if (elapsed >= (long)(YELLOW_TIME * 1000)) { 
       manualState = manualTarget; 
       broadcastManualStates();
@@ -566,14 +580,13 @@ void handleManual(unsigned long ms) {
   else if (manualState == MAN_S_GO) { setSouthGo(); updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: SOUTH", "Manual override act.", "Select next lane ->"); }
   else if (manualState == MAN_E_GO) { setEastGo();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: EAST",  "Manual override act.", "Select next lane ->"); }
   else if (manualState == MAN_W_GO) { setWestGo();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> GO: WEST",  "Manual override act.", "Select next lane ->"); }
-  else                              { setAllRed();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> REMOTE CONTROL", "All lanes RED", "Awaiting command..."); }
+  else                               { setAllRed();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", ">> REMOTE CONTROL", "All lanes RED", "Awaiting command..."); }
 }
 
 // =============================================================
 // 12b. EXPLICIT HARDWARE LIGHT STATE BROADCASTER
 // =============================================================
 void broadcastManualStates() {
-  // Evaluates exactly which shift register bits are active and prints the matching status
   String lanes[] = {"NORTH", "SOUTH", "EAST", "WEST"};
   int greens[]   = {N_GREEN, S_GREEN, E_GREEN, W_GREEN};
   int yellows[]  = {N_YELLOW, S_YELLOW, E_YELLOW, W_YELLOW};
@@ -597,7 +610,7 @@ void syncIndicatorLEDs() {
     bitSet(lightState, ledBlue);
   } else {
     bitSet(lightState, ledWhite);
-    if      (manualState == MAN_EMERGENCY)                    bitSet(lightState, ledRed);
+    if       (manualState == MAN_EMERGENCY)                    bitSet(lightState, ledRed);
     else if (manualHazardActive)                               bitSet(lightState, ledYellow);
     else {
       if (manualState == MAN_N_GO || manualTarget == MAN_N_GO) bitSet(lightState, ledNorth);
@@ -617,7 +630,7 @@ void updateShiftRegister() {
 
 void setYellow(String lane) {
   lightState &= 0xFFFF0000;
-  if      (lane == "NORTH") { bitSet(lightState, N_YELLOW); bitSet(lightState, S_RED); bitSet(lightState, E_RED); bitSet(lightState, W_RED); }
+  if       (lane == "NORTH") { bitSet(lightState, N_YELLOW); bitSet(lightState, S_RED); bitSet(lightState, E_RED); bitSet(lightState, W_RED); }
   else if (lane == "SOUTH") { bitSet(lightState, S_YELLOW); bitSet(lightState, N_RED); bitSet(lightState, E_RED); bitSet(lightState, W_RED); }
   else if (lane == "EAST")  { bitSet(lightState, E_YELLOW); bitSet(lightState, N_RED); bitSet(lightState, S_RED); bitSet(lightState, W_RED); }
   else if (lane == "WEST")  { bitSet(lightState, W_YELLOW); bitSet(lightState, N_RED); bitSet(lightState, S_RED); bitSet(lightState, E_RED); }
@@ -639,7 +652,7 @@ void setWestGo()  { lightState &= 0xFFFF0000; bitSet(lightState,N_RED);   bitSet
 
 void setTransitionLights(ManualState prev) {
   lightState &= 0xFFFF0000;
-  if      (prev == MAN_N_GO) { bitSet(lightState,N_YELLOW); bitSet(lightState,S_RED); bitSet(lightState,E_RED); bitSet(lightState,W_RED); }
+  if       (prev == MAN_N_GO) { bitSet(lightState,N_YELLOW); bitSet(lightState,S_RED); bitSet(lightState,E_RED); bitSet(lightState,W_RED); }
   else if (prev == MAN_S_GO) { bitSet(lightState,S_YELLOW); bitSet(lightState,N_RED); bitSet(lightState,E_RED); bitSet(lightState,W_RED); }
   else if (prev == MAN_E_GO) { bitSet(lightState,E_YELLOW); bitSet(lightState,N_RED); bitSet(lightState,S_RED); bitSet(lightState,W_RED); }
   else if (prev == MAN_W_GO) { bitSet(lightState,W_YELLOW); bitSet(lightState,N_RED); bitSet(lightState,S_RED); bitSet(lightState,E_RED); }
@@ -657,7 +670,7 @@ void updateLCD(String l1, String l2, String l3, String l4) {
 }
 
 // =============================================================
-// 15. 7-SEGMENT PER-LANE TIMERS (Supports 3 Digits)
+// 15. 7-SEGMENT PER-LANE TIMERS
 // =============================================================
 void updateTimers(int n, int s, int e, int w) {
   showCentered(timerNorth, n); showCentered(timerSouth, s);
