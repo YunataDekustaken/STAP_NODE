@@ -2,8 +2,8 @@
 STAP: Smart Traffic Automation Program
 =======================================
 v17.2.1-ToyCarLive — Standards-Compliant Hybrid Sequential Micro-Phasing Architecture
-                  with Corrected Native Webcam ROI Canvas Calibration, Reinforced Emergency 
-                  Preemption Filtering, and Inverted Outbound Signal Structural Mapping.
+                   with Corrected Native Webcam ROI Canvas Calibration, Reinforced Emergency 
+                   Preemption Filtering, and Inverted Outbound Signal Structural Mapping.
 """
 
 from ultralytics import YOLO
@@ -44,8 +44,8 @@ BAUD_RATE   = 115200
 
 MODEL_PATH = r"C:\Users\Raphael\Desktop\YOLO\TOY_CAR\runs\detect\train\weights\best.pt"
 
-EMERGENCY_CLASS_IDS = [1, 5, 9]   # ambulance=1, firetruck=5, police=9
-VEHICLE_CLASS_IDS   = [0, 2, 3, 4, 6, 7, 8, 10, 11, 12, 13]
+EMERGENCY_CLASS_IDS = [1]   # ambulance=1
+VEHICLE_CLASS_IDS   = [0]
 
 LANE_NAMES  = ["NORTH", "SOUTH", "EAST", "WEST"]
 PHASE_ORDER = ["NORTH", "SOUTH", "EAST", "WEST"]
@@ -92,13 +92,13 @@ YELLOW_TIME        = 3
 ALL_RED_TIME       = 2 
 CONGESTION_CEILING = 20 
 
-MIN_GREEN       = {lane: max(5,  int(BASE_GREEN[lane] * 0.50)) for lane in LANE_NAMES}
-MAX_GREEN       = {lane: min(90, int(BASE_GREEN[lane] * 1.50)) for lane in LANE_NAMES}
-MAX_ADJUSTMENT  = 15 
-RAIN_EXTRA_TIME = 5
+# --- IMPORTED ACTUAL TIMING CONSTRAINTS ---
+MIN_GREEN       = {lane: max(7,  int(BASE_GREEN[lane] * 0.40)) for lane in LANE_NAMES}
+MAX_GREEN       = {lane: min(65, int(BASE_GREEN[lane] * 1.30)) for lane in LANE_NAMES}
+MAX_ADJUSTMENT  = 10 
 
 LOS_THRESHOLDS = [("A",0,1),("B",2,3),("C",4,6),("D",7,10),("E",11,15),("F",16,999)]
-LOS_DELTA      = {"A":-15,"B":-8,"C":0,"D":+8,"E":+12,"F":+15}
+LOS_DELTA      = {"A":-10,"B":-6,"C":0,"D":+6,"E":+8,"F":+10}
 
 PING_INTERVAL = 0.4
 CONF_THRESHOLD            = 0.80 
@@ -213,7 +213,7 @@ count_smoother = VehicleCountSmoother(COUNT_SMOOTH_WINDOW)
 # =============================================================
 # 4. INITIALIZE LIVE WEBCAMS VIA STABLE INDEX TARGETING
 # =============================================================
-#                   NORTH  SOUTH   EAST   WEST
+#                  NORTH  SOUTH   EAST   WEST
 CAMERA_INDICES = [   3,     2,     0,     1  ] 
 
 caps = []
@@ -461,6 +461,7 @@ def classify_los(count: int) -> str:
         if lo <= count <= hi: return grade
     return "F"
 
+# --- IMPORTED ACTUAL RAIN BUFFER AND TIMING LOGIC ---
 def compute_green_time(lane: str, rain: bool) -> int:
     with result_lock: 
         current_queue = vehicle_counts[lane]
@@ -468,7 +469,7 @@ def compute_green_time(lane: str, rain: bool) -> int:
     
     if current_queue <= 2:
         rain_mod = 1.20 if rain else 1.0
-        return max(5, min(10, int(7 * rain_mod)))
+        return max(7, min(10, int(7 * rain_mod)))
         
     los   = classify_los(current_queue)
     delta = max(-MAX_ADJUSTMENT, min(MAX_ADJUSTMENT, LOS_DELTA[los]))
@@ -477,8 +478,8 @@ def compute_green_time(lane: str, rain: bool) -> int:
         delta = int(delta * 0.5)
         
     green = BASE_GREEN[lane] + delta
-    if rain:
-        green += RAIN_EXTRA_TIME
+    if rain and los in ["D", "E", "F"]:
+        green += 5
         
     return max(MIN_GREEN[lane], min(MAX_GREEN[lane], green))
 
