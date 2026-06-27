@@ -13,6 +13,8 @@ import time
 import serial
 import numpy as np
 import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 import threading
 import torch
 import os
@@ -147,8 +149,8 @@ COUNT_SMOOTH_WINDOW       = 8
 
 # REAL CLUSTER CONSOLE LINK (Prefilled for instant cloud synchronization)
 NODE_API_KEY       = "node_alpha_J7FVxdRBqwCBWQSdiKBN742lMHuEPX5A"
-STAP_HUB_URL       = "https://ais-dev-7gkqxvgmppivzsn5ip7oy7-1033031146789.asia-southeast1.run.app/api/v1/snapshots"
-STAP_HEARTBEAT_URL = "https://ais-dev-7gkqxvgmppivzsn5ip7oy7-1033031146789.asia-southeast1.run.app/api/v1/heartbeat"
+STAP_HUB_URL       = "https://ais-dev-z354axc6z3etv7l7kcerci-1033031146789.asia-southeast1.run.app/api/v1/snapshots"
+STAP_HEARTBEAT_URL = "https://ais-dev-z354axc6z3etv7l7kcerci-1033031146789.asia-southeast1.run.app/api/v1/heartbeat"
 HUB_ENABLED        = True
 HUB_INTERVAL_TICKS = 75 
 
@@ -551,7 +553,7 @@ def post_to_hub():
                     "congestion":         CONGESTION_MAP.get(los, "free_flow"),
                     "snapshot_time":      datetime.now().isoformat(),
                 }
-                requests.post(STAP_HUB_URL, json=body, headers=headers, timeout=1.5)
+                requests.post(STAP_HUB_URL, json=body, headers=headers, timeout=2.0, verify=False)
         except Exception as e:
             print(f"[STAP] Cloud synchronization delay: {e}")
     threading.Thread(target=_post, daemon=True).start()
@@ -562,10 +564,12 @@ def hub_heartbeat_thread():
             requests.post(
                 STAP_HEARTBEAT_URL,
                 headers={"Authorization": f"Bearer {NODE_API_KEY}", "Accept": "application/json"},
-                timeout=1.5
+                timeout=2.0,
+                verify=False
             )
-        except Exception: pass
-        time.sleep(30)
+        except Exception as e:
+            print(f"[STAP] Heartbeat failed to send: {e}")
+        time.sleep(5)
 
 # =============================================================
 # 8. PER-LANE FLASK MJPEG MULTI-STREAM INTERFACES
@@ -669,6 +673,20 @@ def get_status():
         STAP_HUB_URL = f"{hub_origin}/api/v1/snapshots"
         STAP_HEARTBEAT_URL = f"{hub_origin}/api/v1/heartbeat"
         print(f"[STAP] 🔄 Dynamically updated cloud hub URLs to: {hub_origin}")
+        
+        # Trigger an immediate out-of-band heartbeat to instantly flag node as online in Express
+        def trigger_immediate_heartbeat():
+            try:
+                requests.post(
+                    STAP_HEARTBEAT_URL,
+                    headers={"Authorization": f"Bearer {NODE_API_KEY}", "Accept": "application/json"},
+                    timeout=2.0,
+                    verify=False
+                )
+                print("[STAP] ⚡ Triggered immediate cloud heartbeat successfully.")
+            except Exception as e:
+                print(f"[STAP] ⚠️ Immediate heartbeat failed: {e}")
+        threading.Thread(target=trigger_immediate_heartbeat, daemon=True).start()
 
     with result_lock:
         counts   = vehicle_counts.copy()
@@ -847,9 +865,9 @@ def hub_realtime_sync_thread():
                 "Content-Type": "application/json",
                 "Accept": "application/json"
             }
-            requests.post(control_url, json=body, headers=headers, timeout=1.5)
-        except Exception:
-            pass
+            requests.post(control_url, json=body, headers=headers, timeout=2.0, verify=False)
+        except Exception as e:
+            print(f"[STAP] ⚠️ Real-time sync to Cloud Hub failed: {e}")
         time.sleep(1.0)
 
 def hub_images_upload_thread():
@@ -878,7 +896,7 @@ def hub_images_upload_thread():
                                 "lane": lane.lower(),
                                 "imageBase64": f"data:image/jpeg;base64,{base64_str}"
                             }
-                            resp = requests.post(upload_url, json=body, headers=headers, timeout=2.0)
+                            resp = requests.post(upload_url, json=body, headers=headers, timeout=3.0, verify=False)
                             if resp.status_code == 200:
                                 print(f"[STAP] ☁️ Uploaded {lane} frame to Cloud Proxy successfully.")
                             else:
