@@ -423,7 +423,6 @@ void runAutoOnline(unsigned long ms) {
       break;
   }
 
-  // FIXED: Adjusted header title lengths down to < 20 characters
   String title  = rainDetected ? "- AUTO (+RAIN) -" : "- AUTO (SMART AI) -";
   String sigStr;
   int    disp   = 0;
@@ -498,7 +497,6 @@ void runAutoFallback(unsigned long ms) {
   updateTimers(timers[0], timers[1], timers[2], timers[3]);
 
   String sig  = fallbackInYellow ? "YELLOW" : "GREEN";
-  // FIXED: Concatenated dynamic strings rewritten to guarantee total length <= 20 chars
   updateLCD("- AUTO FALLBACK -", "NETWORK LOSS",
             "Lane: " + fbLane + " (" + sig + ")",
             "Countdown: " + String(currentRemaining) + "s");
@@ -574,7 +572,6 @@ void handleManual(unsigned long ms) {
     return;
   }
 
-  // FIXED: Simplified status messaging lengths to remove trailing LCD noise
   if      (manualState == MAN_N_GO) { setNorthGo(); updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", "GO: NORTH", "Override Active", "Select next lane..."); }
   else if (manualState == MAN_S_GO) { setSouthGo(); updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", "GO: SOUTH", "Override Active", "Select next lane..."); }
   else if (manualState == MAN_E_GO) { setEastGo();  updateTimers(-1,-1,-1,-1); updateLCD("--- MANUAL MODE ---", "GO: EAST",  "Override Active", "Select next lane..."); }
