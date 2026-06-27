@@ -664,8 +664,16 @@ def control_emergency():
     send_to_esp32(f'EMERGENCY_OVERRIDE:{lane}')
     return jsonify({'success': True, 'emergency_lane': lane})
 
-@app.route('/status', methods=['GET'])
+@app.route('/status', methods=['GET', 'OPTIONS'])
 def get_status():
+    if request.method == 'OPTIONS':
+        from flask import make_response
+        resp = make_response()
+        resp.headers.add("Access-Control-Allow-Origin", "*")
+        resp.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        resp.headers.add("Access-Control-Allow-Methods", "GET, OPTIONS")
+        return resp
+
     global STAP_HUB_URL, STAP_HEARTBEAT_URL
     hub_origin = request.args.get('hub_origin')
     if hub_origin:
@@ -705,11 +713,15 @@ def get_status():
         remaining = max(0, ALL_RED_TIME - int(now - all_red_start_time if all_red_start_time > 0 else 0.0))
 
     los_per_lane = {lane: classify_los(counts[lane]) for lane in LANE_NAMES}
-    return jsonify({
+    resp = jsonify({
         'active_lane': active_lane, 'phase_state': current_state, 'remaining_secs': remaining,
         'green_duration': green_dur, 'mode': 'manual' if manual_override else 'auto', 'rain': rain_detected,
         'vehicle_counts': counts, 'los': los_per_lane, 'lane_statuses': statuses,
     })
+    resp.headers.add("Access-Control-Allow-Origin", "*")
+    resp.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization")
+    resp.headers.add("Access-Control-Allow-Methods", "GET, OPTIONS")
+    return resp
 
 def run_flask_server():
     app.run(host='0.0.0.0', port=5000, threaded=True, use_reloader=False)
