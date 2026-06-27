@@ -662,6 +662,14 @@ def control_emergency():
 
 @app.route('/status', methods=['GET'])
 def get_status():
+    global STAP_HUB_URL, STAP_HEARTBEAT_URL
+    hub_origin = request.args.get('hub_origin')
+    if hub_origin:
+        hub_origin = hub_origin.rstrip('/')
+        STAP_HUB_URL = f"{hub_origin}/api/v1/snapshots"
+        STAP_HEARTBEAT_URL = f"{hub_origin}/api/v1/heartbeat"
+        print(f"[STAP] 🔄 Dynamically updated cloud hub URLs to: {hub_origin}")
+
     with result_lock:
         counts   = vehicle_counts.copy()
         statuses = lane_statuses.copy()
@@ -754,9 +762,9 @@ def keepalive_thread():
 
 def hub_realtime_sync_thread():
     if not HUB_ENABLED: return
-    control_url = STAP_HUB_URL.replace("/api/v1/snapshots", "/api/v1/control")
     while True:
         try:
+            control_url = STAP_HUB_URL.replace("/api/v1/snapshots", "/api/v1/control")
             with result_lock:
                 counts   = vehicle_counts.copy()
                 statuses = lane_statuses.copy()
@@ -846,15 +854,15 @@ def hub_realtime_sync_thread():
 
 def hub_images_upload_thread():
     if not HUB_ENABLED: return
-    upload_url = STAP_HUB_URL.replace("/api/v1/snapshots", "/api/v1/snapshot-upload")
     headers = {
         "Authorization": f"Bearer {NODE_API_KEY}",
         "Content-Type": "application/json",
         "Accept": "application/json"
     }
-    print("[STAP] ☁️ Cloud camera proxy thread started. Target:", upload_url)
+    print("[STAP] ☁️ Cloud camera proxy thread started.")
     while True:
         try:
+            upload_url = STAP_HUB_URL.replace("/api/v1/snapshots", "/api/v1/snapshot-upload")
             for lane in LANE_NAMES:
                 try:
                     with lane_stream_locks[lane]:
