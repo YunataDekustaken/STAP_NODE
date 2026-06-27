@@ -752,6 +752,136 @@ def keepalive_thread():
             hub_tick = 0
             post_to_hub()
 
+def hub_realtime_sync_thread():
+    if not HUB_ENABLED: return
+    control_url = STAP_HUB_URL.replace("/api/v1/snapshots", "/api/v1/control")
+    while True:
+        try:
+            with result_lock:
+                counts   = vehicle_counts.copy()
+                statuses = lane_statuses.copy()
+                occupancy = lane_live_occupancy_pct.copy()
+                local_manual_lights = manual_lane_lights.copy()
+            
+            with phase_lock:
+                snap_lane    = PHASE_ORDER[current_phase_idx]
+                snap_state   = phase_state
+                snap_green   = committed_green
+                snap_g_start = green_start_time
+                snap_y_start = yellow_start_time
+                snap_ar_start= all_red_start_time
+
+            now = time.time()
+            if snap_state == "GREEN":
+                disp_remain = max(0, snap_green - int(now - snap_g_start))
+            elif snap_state == "YELLOW":
+                disp_remain = max(0, YELLOW_TIME - int(now - snap_y_start if snap_y_start > 0 else 0.0))
+            else:
+                disp_remain = max(0, ALL_RED_TIME - int(now - snap_ar_start if snap_ar_start > 0 else 0.0))
+
+            lanes_payload = {}
+            for lane in LANE_NAMES:
+                light_is_red    = False
+                light_is_yellow = False
+                light_is_green  = False
+
+                if manual_override:
+                    current_hardware_lamp = local_manual_lights.get(lane, "RED")
+                    if current_hardware_lamp == "GREEN":     
+                        light_is_green = True
+                    elif current_hardware_lamp == "YELLOW": 
+                        light_is_yellow = True
+                    else:
+                        is_hazard_active = (now - last_hazard_blink_time < 1.5)
+                        light_is_red = not is_hazard_active
+                else:
+                    if snap_state == "ALL_RED":
+                        light_is_red = True
+                    elif lane == snap_lane:
+                        if snap_state == "GREEN":   light_is_green = True
+                        elif snap_state == "YELLOW": light_is_yellow = True
+                    else:
+                        light_is_red = True 
+
+                light_str = "RED"
+                if light_is_green: light_str = "GREEN"
+                elif light_is_yellow: light_str = "YELLOW"
+
+                los = classify_los(counts[lane])
+                density = int(occupancy.get(lane, 0.0))
+
+                lanes_payload[lane] = {
+                    "count": counts[lane],
+                    "density": density,
+                    "light": light_str,
+                    "los": los
+                }
+
+            mode_str = "AUTO"
+            if manual_override:
+                is_hazard_active = (now - last_hazard_blink_time < 1.5)
+                if is_hazard_active or (ser is not None and getattr(ser, "is_open", False) and any(local_manual_lights.get(l) == "YELLOW" for l in LANE_NAMES)):
+                    mode_str = "HAZARD"
+                else:
+                    mode_str = "MANUAL"
+
+            body = {
+                "mode": mode_str,
+                "activeLane": snap_lane,
+                "weather": "RAINY" if rain_detected else "SUNNY",
+                "remainingSecs": disp_remain,
+                "greenDuration": snap_green,
+                "lanes": lanes_payload
+            }
+
+            headers = {
+                "Authorization": f"Bearer {NODE_API_KEY}",
+                "Content-Type": "application/json",
+                "Accept": "application/json"
+            }
+            requests.post(control_url, json=body, headers=headers, timeout=1.5)
+        except Exception:
+            pass
+        time.sleep(1.0)
+
+def hub_images_upload_thread():
+    if not HUB_ENABLED: return
+    upload_url = STAP_HUB_URL.replace("/api/v1/snapshots", "/api/v1/snapshot-upload")
+    headers = {
+        "Authorization": f"Bearer {NODE_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+    print("[STAP] ☁️ Cloud camera proxy thread started. Target:", upload_url)
+    while True:
+        try:
+            for lane in LANE_NAMES:
+                try:
+                    with lane_stream_locks[lane]:
+                        frame = global_lane_frames[lane]
+                    if frame is not None:
+                        # Resize to lower resolution to save network bandwidth while preserving visual details
+                        small_frame = cv2.resize(frame, (320, 240))
+                        ret, buffer = cv2.imencode('.jpg', small_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 35])
+                        if ret:
+                            import base64
+                            base64_str = base64.b64encode(buffer).decode('utf-8')
+                            body = {
+                                "lane": lane.lower(),
+                                "imageBase64": f"data:image/jpeg;base64,{base64_str}"
+                            }
+                            resp = requests.post(upload_url, json=body, headers=headers, timeout=2.0)
+                            if resp.status_code == 200:
+                                print(f"[STAP] ☁️ Uploaded {lane} frame to Cloud Proxy successfully.")
+                            else:
+                                print(f"[STAP] ⚠️ Upload failed for lane {lane}: Code {resp.status_code}, {resp.text}")
+                except Exception as e:
+                    print(f"[STAP] ⚠️ Connection/Upload error for lane {lane}: {e}")
+                time.sleep(0.4) # Slight staggered delay between lanes
+        except Exception as outer_e:
+            print(f"[STAP] ⚠️ Outer upload exception: {outer_e}")
+        time.sleep(1.0)
+
 CSV_PATH = os.path.join(CURRENT_RUN_DIR, "traffic_summary.csv")
 with open(CSV_PATH, mode='w', newline='', encoding='utf-8') as f:
     writer = csv.writer(f)
@@ -761,6 +891,8 @@ with open(CSV_PATH, mode='w', newline='', encoding='utf-8') as f:
 
 threading.Thread(target=keepalive_thread, daemon=True).start()
 threading.Thread(target=hub_heartbeat_thread, daemon=True).start()
+threading.Thread(target=hub_realtime_sync_thread, daemon=True).start()
+threading.Thread(target=hub_images_upload_thread, daemon=True).start()
 threading.Thread(target=run_flask_server, daemon=True).start() 
 print("[STAP] ✅ Per-lane casting nodes are active on Local LAN Port 5000")
 
@@ -807,8 +939,18 @@ try:
             snap_y_start = yellow_start_time
             snap_ar_start= all_red_start_time
 
-        if any(f is None for f in imgs):
-            time.sleep(0.01); continue
+        # Ensure every lane has a frame. If None, create an elegant neon offline placeholder frame
+        # so that a single slow or offline stream doesn't freeze the loop or stop telemetry/phasing.
+        for idx, lane in enumerate(LANE_NAMES):
+            if imgs[idx] is None:
+                placeholder = np.zeros((CAM_HEIGHT, CAM_WIDTH, 3), dtype=np.uint8)
+                cv2.rectangle(placeholder, (5, 5), (CAM_WIDTH-5, CAM_HEIGHT-5), (20, 20, 25), -1)
+                cv2.rectangle(placeholder, (5, 5), (CAM_WIDTH-5, CAM_HEIGHT-5), ROI_COLORS[lane], 2)
+                cv2.putText(placeholder, f"{lane} CONNECTING...", (160, CAM_HEIGHT//2 - 20), 
+                            cv2.FONT_HERSHEY_DUPLEX, 0.7, (100, 100, 255), 2, cv2.LINE_AA)
+                cv2.putText(placeholder, "WAITING FOR VIDEO DECODER FEED", (110, CAM_HEIGHT//2 + 20), 
+                            cv2.FONT_HERSHEY_DUPLEX, 0.5, (120, 120, 130), 1, cv2.LINE_AA)
+                imgs[idx] = placeholder
 
         now = time.time()
         if snap_state == "GREEN":
