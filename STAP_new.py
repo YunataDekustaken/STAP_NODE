@@ -481,8 +481,58 @@ def read_serial_incoming():
                 if lane in LANE_NAMES and hardware_lamp in ["RED", "YELLOW", "GREEN"]:
                     with result_lock:
                         manual_lane_lights[lane] = hardware_lamp
+                    if hardware_lamp == "GREEN":
+                        with phase_lock:
+                            current_phase_idx = PHASE_ORDER.index(lane)
+                            phase_state = "GREEN"
+                    elif hardware_lamp == "YELLOW":
+                        with phase_lock:
+                            current_phase_idx = PHASE_ORDER.index(lane)
+                            phase_state = "YELLOW"
                         
         except Exception: pass
+
+def get_lane_light_states():
+    with result_lock:
+        local_manual_lights = manual_lane_lights.copy()
+    with phase_lock:
+        snap_lane = PHASE_ORDER[current_phase_idx]
+        snap_state = phase_state
+
+    lights = {}
+    for lane in LANE_NAMES:
+        light_is_red    = False
+        light_is_yellow = False
+        light_is_green  = False
+
+        if manual_override:
+            if emergency_active:
+                light_is_red = True
+            elif hazard_active:
+                light_is_yellow = True
+            else:
+                current_hardware_lamp = local_manual_lights.get(lane, "RED")
+                if current_hardware_lamp == "GREEN":     
+                    light_is_green = True
+                elif current_hardware_lamp == "YELLOW": 
+                    light_is_yellow = True
+                else:
+                    light_is_red = True
+        else:
+            if snap_state == "ALL_RED":
+                light_is_red = True
+            elif lane == snap_lane:
+                if snap_state == "GREEN":   light_is_green = True
+                elif snap_state == "YELLOW": light_is_yellow = True
+            else:
+                light_is_red = True 
+
+        light_str = "RED"
+        if light_is_green: light_str = "GREEN"
+        elif light_is_yellow: light_str = "YELLOW"
+        lights[lane] = light_str
+
+    return lights
 
 def classify_los(count: int) -> str:
     for grade, lo, hi in LOS_THRESHOLDS:
@@ -634,11 +684,12 @@ def control_mode():
         green = compute_green_time(lane, rain_detected)
         start_green(lane, green)
     elif mode == 'manual':
-        manual_override = True
-        hazard_active = False
-        emergency_active = False
-        send_to_esp32('MODE:MANUAL')
-        reset_all_manual_lights_to_red()
+        if not manual_override or hazard_active or emergency_active:
+            manual_override = True
+            hazard_active = False
+            emergency_active = False
+            send_to_esp32('MODE:MANUAL')
+            reset_all_manual_lights_to_red()
     elif mode == 'hazard':
         manual_override = True
         hazard_active = True
@@ -724,6 +775,7 @@ def get_status():
     with result_lock:
         counts   = vehicle_counts.copy()
         statuses = lane_statuses.copy()
+        occupancy = lane_live_occupancy_pct.copy()
     with phase_lock:
         active_lane   = PHASE_ORDER[current_phase_idx]
         current_state = phase_state
@@ -746,10 +798,23 @@ def get_status():
         status_mode = 'manual'
 
     los_per_lane = {lane: classify_los(counts[lane]) for lane in LANE_NAMES}
+    
+    lights_map = get_lane_light_states()
+    lanes_payload = {}
+    for lane in LANE_NAMES:
+        density = int(occupancy.get(lane, 0.0))
+        lanes_payload[lane] = {
+            "count": counts[lane],
+            "density": density,
+            "light": lights_map[lane],
+            "los": los_per_lane[lane]
+        }
+
     resp = jsonify({
         'active_lane': active_lane, 'phase_state': current_state, 'remaining_secs': remaining,
         'green_duration': green_dur, 'mode': status_mode, 'rain': rain_detected,
         'vehicle_counts': counts, 'los': los_per_lane, 'lane_statuses': statuses,
+        'lanes': lanes_payload
     })
     resp.headers.add("Access-Control-Allow-Origin", "*")
     resp.headers.add("Access-Control-Allow-Headers", "Content-Type, Authorization")
