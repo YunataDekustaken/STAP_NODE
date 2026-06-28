@@ -457,10 +457,15 @@ last_comm_time  = time.time()
 
 def read_serial_incoming():
     global rain_detected, manual_override, last_comm_time, hazard_active, emergency_active
-    if ser and ser.in_waiting:
-        try:
+    if not ser:
+        return
+    try:
+        lines_read = 0
+        while ser.in_waiting > 0 and lines_read < 30:
+            lines_read += 1
             line = ser.readline().decode("utf-8", errors="ignore").strip()
-            if not line: return
+            if not line:
+                continue
             
             last_comm_time = time.time()
             
@@ -489,8 +494,8 @@ def read_serial_incoming():
                         with phase_lock:
                             current_phase_idx = PHASE_ORDER.index(lane)
                             phase_state = "YELLOW"
-                        
-        except Exception: pass
+    except Exception:
+        pass
 
 def get_lane_light_states():
     with result_lock:
