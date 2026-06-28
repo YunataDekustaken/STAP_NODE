@@ -657,6 +657,7 @@ def control_mode():
 @app.route('/control/light', methods=['POST', 'OPTIONS'])
 def control_light():
     if request.method == 'OPTIONS': return jsonify({}), 200
+    global current_phase_idx, phase_state, green_start_time
     if not manual_override: return jsonify({'success': False, 'message': 'Requires Manual Override mode first.'}), 422
     data  = request.get_json(force=True)
     lane  = data.get('lane', '').upper()
@@ -664,6 +665,12 @@ def control_light():
 
     if lane not in LANE_NAMES or state not in ['red', 'yellow', 'green']:
         return jsonify({'success': False, 'message': 'Invalid fields.'}), 400
+
+    if lane in PHASE_ORDER:
+        with phase_lock:
+            current_phase_idx = PHASE_ORDER.index(lane)
+            phase_state = 'GREEN' if state == 'green' else ('YELLOW' if state == 'yellow' else 'ALL_RED')
+            green_start_time = time.time()
 
     send_to_esp32(f'MANUAL_LIGHT:{lane},{state.upper()}')
     return jsonify({'success': True, 'lane': lane, 'state': state})
@@ -730,10 +737,18 @@ def get_status():
     else:
         remaining = max(0, ALL_RED_TIME - int(now - all_red_start_time if all_red_start_time > 0 else 0.0))
 
+    status_mode = 'auto'
+    if emergency_active:
+        status_mode = 'emergency'
+    elif hazard_active:
+        status_mode = 'hazard'
+    elif manual_override:
+        status_mode = 'manual'
+
     los_per_lane = {lane: classify_los(counts[lane]) for lane in LANE_NAMES}
     resp = jsonify({
         'active_lane': active_lane, 'phase_state': current_state, 'remaining_secs': remaining,
-        'green_duration': green_dur, 'mode': 'manual' if manual_override else 'auto', 'rain': rain_detected,
+        'green_duration': green_dur, 'mode': status_mode, 'rain': rain_detected,
         'vehicle_counts': counts, 'los': los_per_lane, 'lane_statuses': statuses,
     })
     resp.headers.add("Access-Control-Allow-Origin", "*")
