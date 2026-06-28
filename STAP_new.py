@@ -451,10 +451,12 @@ def send_to_esp32(msg: str):
 
 rain_detected   = False
 manual_override = False
+hazard_active   = False
+emergency_active = False
 last_comm_time  = time.time()
 
 def read_serial_incoming():
-    global rain_detected, manual_override, last_comm_time
+    global rain_detected, manual_override, last_comm_time, hazard_active, emergency_active
     if ser and ser.in_waiting:
         try:
             line = ser.readline().decode("utf-8", errors="ignore").strip()
@@ -468,6 +470,10 @@ def read_serial_incoming():
                         rain_detected = (part.split(":")[1] == "1")
                     elif part.startswith("MODE:"):
                         manual_override = (part.split(":")[1] == "MANUAL")
+                    elif part.startswith("HAZARD:"):
+                        hazard_active = (part.split(":")[1] == "1")
+                    elif part.startswith("EMERGENCY:"):
+                        emergency_active = (part.split(":")[1] == "1")
             
             elif line.startswith("STATE:"):
                 payload = line.replace("STATE:", "")
@@ -612,27 +618,39 @@ def add_cors(response):
 @app.route('/control/mode', methods=['POST', 'OPTIONS'])
 def control_mode():
     if request.method == 'OPTIONS': return jsonify({}), 200
-    global manual_override, current_phase_idx, phase_state, green_start_time, committed_green
+    global manual_override, current_phase_idx, phase_state, green_start_time, committed_green, hazard_active, emergency_active
     data = request.get_json(force=True)
     mode = data.get('mode', '').lower()
 
-    if mode not in ['auto', 'manual', 'hazard']:
+    if mode not in ['auto', 'manual', 'hazard', 'emergency']:
         return jsonify({'success': False, 'message': 'Invalid mode.'}), 400
 
     if mode == 'auto':
         manual_override = False
+        hazard_active = False
+        emergency_active = False
         send_to_esp32('MODE:AUTO')
         with phase_lock: lane = PHASE_ORDER[current_phase_idx]
         green = compute_green_time(lane, rain_detected)
         start_green(lane, green)
     elif mode == 'manual':
         manual_override = True
+        hazard_active = False
+        emergency_active = False
         send_to_esp32('MODE:MANUAL')
         reset_all_manual_lights_to_red()
     elif mode == 'hazard':
         manual_override = True
+        hazard_active = True
+        emergency_active = False
         send_to_esp32('MODE:HAZARD')
         for lane in LANE_NAMES: send_to_esp32(f'HAZARD:{lane}')
+    elif mode == 'emergency':
+        manual_override = True
+        hazard_active = False
+        emergency_active = True
+        send_to_esp32('MODE:EMERGENCY')
+        reset_all_manual_lights_to_red()
 
     return jsonify({'success': True, 'mode': mode})
 
@@ -824,14 +842,18 @@ def hub_realtime_sync_thread():
                 light_is_green  = False
 
                 if manual_override:
-                    current_hardware_lamp = local_manual_lights.get(lane, "RED")
-                    if current_hardware_lamp == "GREEN":     
-                        light_is_green = True
-                    elif current_hardware_lamp == "YELLOW": 
+                    if emergency_active:
+                        light_is_red = True
+                    elif hazard_active:
                         light_is_yellow = True
                     else:
-                        is_hazard_active = (now - last_hazard_blink_time < 1.5)
-                        light_is_red = not is_hazard_active
+                        current_hardware_lamp = local_manual_lights.get(lane, "RED")
+                        if current_hardware_lamp == "GREEN":     
+                            light_is_green = True
+                        elif current_hardware_lamp == "YELLOW": 
+                            light_is_yellow = True
+                        else:
+                            light_is_red = True
                 else:
                     if snap_state == "ALL_RED":
                         light_is_red = True
@@ -857,8 +879,9 @@ def hub_realtime_sync_thread():
 
             mode_str = "AUTO"
             if manual_override:
-                is_hazard_active = (now - last_hazard_blink_time < 1.5)
-                if is_hazard_active or (ser is not None and getattr(ser, "is_open", False) and any(local_manual_lights.get(l) == "YELLOW" for l in LANE_NAMES)):
+                if emergency_active:
+                    mode_str = "EMERGENCY"
+                elif hazard_active:
                     mode_str = "HAZARD"
                 else:
                     mode_str = "MANUAL"
@@ -882,44 +905,6 @@ def hub_realtime_sync_thread():
             print(f"[STAP] ⚠️ Real-time sync to Cloud Hub failed: {e}")
         time.sleep(1.0)
 
-def hub_images_upload_thread():
-    if not HUB_ENABLED: return
-    headers = {
-        "Authorization": f"Bearer {NODE_API_KEY}",
-        "Content-Type": "application/json",
-        "Accept": "application/json"
-    }
-    print("[STAP] ☁️ Cloud camera proxy thread started.")
-    while True:
-        try:
-            upload_url = STAP_HUB_URL.replace("/api/v1/snapshots", "/api/v1/snapshot-upload")
-            for lane in LANE_NAMES:
-                try:
-                    with lane_stream_locks[lane]:
-                        frame = global_lane_frames[lane]
-                    if frame is not None:
-                        # Resize to lower resolution to save network bandwidth while preserving visual details
-                        small_frame = cv2.resize(frame, (320, 240))
-                        ret, buffer = cv2.imencode('.jpg', small_frame, [int(cv2.IMWRITE_JPEG_QUALITY), 35])
-                        if ret:
-                            import base64
-                            base64_str = base64.b64encode(buffer).decode('utf-8')
-                            body = {
-                                "lane": lane.lower(),
-                                "imageBase64": f"data:image/jpeg;base64,{base64_str}"
-                            }
-                            resp = requests.post(upload_url, json=body, headers=headers, timeout=3.0, verify=False)
-                            if resp.status_code == 200:
-                                print(f"[STAP] ☁️ Uploaded {lane} frame to Cloud Proxy successfully.")
-                            else:
-                                print(f"[STAP] ⚠️ Upload failed for lane {lane}: Code {resp.status_code}, {resp.text}")
-                except Exception as e:
-                    print(f"[STAP] ⚠️ Connection/Upload error for lane {lane}: {e}")
-                time.sleep(0.4) # Slight staggered delay between lanes
-        except Exception as outer_e:
-            print(f"[STAP] ⚠️ Outer upload exception: {outer_e}")
-        time.sleep(1.0)
-
 CSV_PATH = os.path.join(CURRENT_RUN_DIR, "traffic_summary.csv")
 with open(CSV_PATH, mode='w', newline='', encoding='utf-8') as f:
     writer = csv.writer(f)
@@ -930,7 +915,6 @@ with open(CSV_PATH, mode='w', newline='', encoding='utf-8') as f:
 threading.Thread(target=keepalive_thread, daemon=True).start()
 threading.Thread(target=hub_heartbeat_thread, daemon=True).start()
 threading.Thread(target=hub_realtime_sync_thread, daemon=True).start()
-threading.Thread(target=hub_images_upload_thread, daemon=True).start()
 threading.Thread(target=run_flask_server, daemon=True).start() 
 print("[STAP] ✅ Per-lane casting nodes are active on Local LAN Port 5000")
 
