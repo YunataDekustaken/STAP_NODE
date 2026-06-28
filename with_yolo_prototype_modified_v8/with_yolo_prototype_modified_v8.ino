@@ -205,10 +205,24 @@ void loop() {
     silenceStartMillis = 0;
     updateShiftRegister();
   } else if (checkButtonPress(btnManual)) {
+    ManualState startingState = MAN_STOPPED;
+    if (currentMode == AUTO) {
+      if      (activeLane == "NORTH" && onlineSignal == SIG_GREEN) startingState = MAN_N_GO;
+      else if (activeLane == "SOUTH" && onlineSignal == SIG_GREEN) startingState = MAN_S_GO;
+      else if (activeLane == "EAST"  && onlineSignal == SIG_GREEN) startingState = MAN_E_GO;
+      else if (activeLane == "WEST"  && onlineSignal == SIG_GREEN) startingState = MAN_W_GO;
+    }
     currentMode  = MANUAL;
-    manualState  = MAN_STOPPED;
-    manualTarget = MAN_STOPPED;
-    setAllRed();
+    manualState  = startingState;
+    manualTarget = startingState;
+    if (startingState == MAN_STOPPED) {
+      setAllRed();
+    } else {
+      if      (startingState == MAN_N_GO) setNorthGo();
+      else if (startingState == MAN_S_GO) setSouthGo();
+      else if (startingState == MAN_E_GO) setEastGo();
+      else if (startingState == MAN_W_GO) setWestGo();
+    }
     broadcastManualStates();
   }
 
@@ -286,11 +300,27 @@ void parsePythonCommand(String msg) {
       updateShiftRegister();
     } else if (mode == "MANUAL") {
       if (currentMode != MANUAL || manualHazardActive || manualState == MAN_EMERGENCY) {
+        ManualState startingState = MAN_STOPPED;
+        if (currentMode == AUTO) {
+          if      (activeLane == "NORTH" && onlineSignal == SIG_GREEN) startingState = MAN_N_GO;
+          else if (activeLane == "SOUTH" && onlineSignal == SIG_GREEN) startingState = MAN_S_GO;
+          else if (activeLane == "EAST"  && onlineSignal == SIG_GREEN) startingState = MAN_E_GO;
+          else if (activeLane == "WEST"  && onlineSignal == SIG_GREEN) startingState = MAN_W_GO;
+        }
+        
         currentMode  = MANUAL;
-        manualState  = MAN_STOPPED;
-        manualTarget = MAN_STOPPED;
+        manualState  = startingState;
+        manualTarget = startingState;
         manualHazardActive = false;
-        setAllRed();
+        
+        if (startingState == MAN_STOPPED) {
+          setAllRed();
+        } else {
+          if      (startingState == MAN_N_GO) setNorthGo();
+          else if (startingState == MAN_S_GO) setSouthGo();
+          else if (startingState == MAN_E_GO) setEastGo();
+          else if (startingState == MAN_W_GO) setWestGo();
+        }
         broadcastManualStates();
       }
     } else if (mode == "HAZARD") {
