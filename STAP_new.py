@@ -149,8 +149,8 @@ COUNT_SMOOTH_WINDOW       = 8
 
 # REAL CLUSTER CONSOLE LINK (Prefilled for instant cloud synchronization)
 NODE_API_KEY       = "node_alpha_J7FVxdRBqwCBWQSdiKBN742lMHuEPX5A"
-STAP_HUB_URL       = "https://ais-dev-z354axc6z3etv7l7kcerci-1033031146789.asia-southeast1.run.app/api/v1/snapshots"
-STAP_HEARTBEAT_URL = "https://ais-dev-z354axc6z3etv7l7kcerci-1033031146789.asia-southeast1.run.app/api/v1/heartbeat"
+STAP_HUB_URL       = "https://stap-hub.vercel.app/api/v1/snapshots"
+STAP_HEARTBEAT_URL = "https://stap-hub.vercel.app/api/v1/heartbeat"
 HUB_ENABLED        = True
 HUB_INTERVAL_TICKS = 75 
 
@@ -578,6 +578,39 @@ def emergency_lane():
         if emg_buffer.is_confirmed(lane):
             return lane
     return None
+
+def upload_csv_to_hub():
+    if not HUB_ENABLED:
+        return
+    try:
+        if not os.path.exists(CSV_PATH):
+            print(f"[STAP] ⚠️ Upload skipped: Ledger file does not exist at {CSV_PATH}")
+            return
+
+        with open(CSV_PATH, "r", encoding="utf-8") as f:
+            csv_content = f.read()
+
+        upload_url = STAP_HUB_URL.replace("/api/v1/snapshots", "/api/v1/upload-ledger")
+        filename = f"traffic_summary_run_{run_idx}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+        headers = {
+            "Authorization": f"Bearer {NODE_API_KEY}",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+        body = {
+            "filename": filename,
+            "csvData": csv_content
+        }
+
+        print(f"[STAP] 📤 Uploading compiled master ledger to hub: {upload_url}...")
+        response = requests.post(upload_url, json=body, headers=headers, timeout=10.0, verify=False)
+        if response.status_code == 200:
+            print(f"[STAP] ✅ Ledger upload successful: {filename}")
+        else:
+            print(f"[STAP] ⚠️ Ledger upload returned status code {response.status_code}: {response.text}")
+    except Exception as e:
+        print(f"[STAP] ❌ Failed to upload ledger to STAP Hub: {e}")
 
 def post_to_hub():
     if not HUB_ENABLED: return
@@ -1363,6 +1396,12 @@ finally:
                 writer.writerow(totals_row)
                 
             print(f"[STAP] ✅ Master Data Export successful. Total unique intersection vehicles logged: {intersection_grand_total}")
+            
+            # Auto-upload compiled ledger to the STAP Hub central server
+            try:
+                upload_csv_to_hub()
+            except Exception as upload_err:
+                print(f"[STAP] ⚠️ Safe bypass: Ledger auto-upload failure: {upload_err}")
         except Exception as csv_err:
             print(f"[STAP] ❌ Failed to compile final absolute metrics spreadsheet rows: {csv_err}")
             
