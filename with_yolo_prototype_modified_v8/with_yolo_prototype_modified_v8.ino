@@ -285,12 +285,14 @@ void parsePythonCommand(String msg) {
       manualTarget       = MAN_STOPPED;
       updateShiftRegister();
     } else if (mode == "MANUAL") {
-      currentMode  = MANUAL;
-      manualState  = MAN_STOPPED;
-      manualTarget = MAN_STOPPED;
-      manualHazardActive = false;
-      setAllRed();
-      broadcastManualStates();
+      if (currentMode != MANUAL || manualHazardActive || manualState == MAN_EMERGENCY) {
+        currentMode  = MANUAL;
+        manualState  = MAN_STOPPED;
+        manualTarget = MAN_STOPPED;
+        manualHazardActive = false;
+        setAllRed();
+        broadcastManualStates();
+      }
     } else if (mode == "HAZARD") {
       currentMode        = MANUAL;
       manualHazardActive = true;
@@ -596,6 +598,12 @@ void handleManual(unsigned long ms) {
 
     if (elapsed >= (long)(YELLOW_TIME * 1000)) { 
       manualState = manualTarget; 
+      if      (manualState == MAN_N_GO) { setNorthGo(); }
+      else if (manualState == MAN_S_GO) { setSouthGo(); }
+      else if (manualState == MAN_E_GO) { setEastGo();  }
+      else if (manualState == MAN_W_GO) { setWestGo();  }
+      else                              { setAllRed();  }
+      updateShiftRegister();
       broadcastManualStates();
     }
     return;
