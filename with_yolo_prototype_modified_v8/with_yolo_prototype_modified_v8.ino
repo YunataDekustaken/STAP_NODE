@@ -172,7 +172,9 @@ void loop() {
     lastTelemetryTime = ms;
     Serial.println(
       "RAIN:" + String(rainDetected ? "1" : "0") +
-      ",MODE:" + String(currentMode == MANUAL ? "MANUAL" : "AUTO")
+      ",MODE:" + String(currentMode == MANUAL ? "MANUAL" : "AUTO") +
+      ",HAZARD:" + String(manualHazardActive ? "1" : "0") +
+      ",EMERGENCY:" + String(manualState == MAN_EMERGENCY ? "1" : "0")
     );
     if (currentMode == MANUAL) {
       broadcastManualStates();
@@ -295,6 +297,13 @@ void parsePythonCommand(String msg) {
       manualState        = MAN_STOPPED;
       manualTarget       = MAN_STOPPED;
       updateShiftRegister();
+    } else if (mode == "EMERGENCY") {
+      currentMode  = MANUAL;
+      manualState  = MAN_EMERGENCY;
+      manualTarget = MAN_EMERGENCY;
+      manualHazardActive = false;
+      setAllRed();
+      broadcastManualStates();
     }
     return;
   }
@@ -318,10 +327,30 @@ void parsePythonCommand(String msg) {
     lane.trim();
     state.trim();
 
-    if      (lane == "NORTH" && state == "GREEN")  { manualState = MAN_N_GO; setNorthGo(); }
-    else if (lane == "SOUTH" && state == "GREEN")  { manualState = MAN_S_GO; setSouthGo(); }
-    else if (lane == "EAST"  && state == "GREEN")  { manualState = MAN_E_GO; setEastGo();  }
-    else if (lane == "WEST"  && state == "GREEN")  { manualState = MAN_W_GO; setWestGo();  }
+    if      (lane == "NORTH" && state == "GREEN") {
+      if (manualState != MAN_N_GO && manualState != MAN_TRANSITION) {
+        prevManualState = manualState; manualTarget = MAN_N_GO; manualState = MAN_TRANSITION; manualTransitionStart = millis();
+        setTransitionLights(prevManualState);
+      }
+    }
+    else if (lane == "SOUTH" && state == "GREEN") {
+      if (manualState != MAN_S_GO && manualState != MAN_TRANSITION) {
+        prevManualState = manualState; manualTarget = MAN_S_GO; manualState = MAN_TRANSITION; manualTransitionStart = millis();
+        setTransitionLights(prevManualState);
+      }
+    }
+    else if (lane == "EAST"  && state == "GREEN") {
+      if (manualState != MAN_E_GO && manualState != MAN_TRANSITION) {
+        prevManualState = manualState; manualTarget = MAN_E_GO; manualState = MAN_TRANSITION; manualTransitionStart = millis();
+        setTransitionLights(prevManualState);
+      }
+    }
+    else if (lane == "WEST"  && state == "GREEN") {
+      if (manualState != MAN_W_GO && manualState != MAN_TRANSITION) {
+        prevManualState = manualState; manualTarget = MAN_W_GO; manualState = MAN_TRANSITION; manualTransitionStart = millis();
+        setTransitionLights(prevManualState);
+      }
+    }
     else if (state == "RED") {
       manualState = MAN_STOPPED;
       setAllRed();
