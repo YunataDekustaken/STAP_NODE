@@ -590,6 +590,19 @@ def upload_csv_to_hub():
         with open(CSV_PATH, "r", encoding="utf-8") as f:
             csv_content = f.read()
 
+        # Check approximate byte size of csv_content string data
+        original_size = len(csv_content.encode('utf-8'))
+        limit_bytes = 4 * 1024 * 1024  # 4 MB
+        if original_size > limit_bytes:
+            print(f"[STAP] ⚠️ CSV payload size ({original_size} bytes) exceeds 4 MB serverless limit. Gracefully truncating...")
+            lines = csv_content.splitlines()
+            if len(lines) > 25:
+                first_part = "\n".join(lines[:5])
+                last_part = "\n".join(lines[-20:])
+                csv_content = f"{first_part}\n... Truncated for Serverless Stream Limit ...\n{last_part}"
+            else:
+                csv_content = f"{csv_content}\n... Truncated for Serverless Stream Limit ..."
+
         upload_url = STAP_HUB_URL.replace("/api/v1/snapshots", "/api/v1/upload-ledger")
         filename = f"traffic_summary_run_{run_idx}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 
